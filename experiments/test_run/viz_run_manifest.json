@@ -1,0 +1,24 @@
+[
+  {
+    "id": "viz_run_0_a_smiling_person_1770318420",
+    "prompt": "a smiling person",
+    "image_path": "experiments/test_run/images/viz_run_0_a_smiling_person_1770318420.png",
+    "trajectory_path": "experiments/test_run/trajectories/viz_run_0_a_smiling_person_1770318420.npz",
+    "embedding_shape": [
+      1,
+      512
+    ],
+    "group": null
+  },
+  {
+    "id": "viz_run_1_a_person_in_a_lab_co_1770318427",
+    "prompt": "a person in a lab coat",
+    "image_path": "experiments/test_run/images/viz_run_1_a_person_in_a_lab_co_1770318427.png",
+    "trajectory_path": "experiments/test_run/trajectories/viz_run_1_a_person_in_a_lab_co_1770318427.npz",
+    "embedding_shape": [
+      1,
+      512
+    ],
+    "group": null
+  }
+]
