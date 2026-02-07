@@ -1,27 +1,49 @@
-from typing import Any, Dict, Tuple
-from .base_hook import BaseTrajectoryHook
+"""Simple FLUX hook adapter that mirrors the SD hook behavior."""
+from typing import List
+import numpy as np
+from .trajectory_capture import TrajectoryCapture
 
-class FluxTrajectoryHook(BaseTrajectoryHook):
-    def _get_target_module(self) -> Any:
-        return getattr(self.pipe, "transformer")
 
-    def _extract_trajectory_data(self, args: Tuple, kwargs: Dict) -> Dict[str, Any]:
-        # signature: forward(hidden_states, encoder_hidden_states=None, timestep=None, ...)
-        
-        hidden_states = kwargs.get("hidden_states") if "hidden_states" in kwargs else (args[0] if len(args) > 0 else None)
-        # Position 1 is encoder_hidden_states, Position 2 is timestep in typical transformer signature if positional
-        # But Flux implementation might vary, relying on kwargs is safer if possible.
-        
-        encoder_hidden_states = kwargs.get("encoder_hidden_states")
-        if encoder_hidden_states is None and len(args) > 1:
-            encoder_hidden_states = args[1]
-            
-        timestep = kwargs.get("timestep")
-        if timestep is None and len(args) > 2:
-            timestep = args[2]
+class FluxHook:
+    def __init__(self, pipeline):
+        self.pipeline = pipeline
+        self.capture = TrajectoryCapture()
+        self.is_hooked = True
 
-        return {
-            "timestep": timestep,
-            "latent": hidden_states.detach().cpu().numpy() if hidden_states is not None else None,
-            "prompt_embedding": encoder_hidden_states.detach().cpu().numpy() if encoder_hidden_states is not None else None,
-        }
+    def reset(self):
+        self.capture.reset()
+
+    def generate(self, prompt: str, num_inference_steps: int = 50, height: int = 512, width: int = 512, **kwargs):
+        if hasattr(self.pipeline, "generate"):
+            try:
+                result = self.pipeline.generate(
+                    prompt=prompt,
+                    num_steps=num_inference_steps,
+                    height=height,
+                    width=width,
+                    **kwargs
+                )
+            except TypeError:
+                result = self.pipeline.generate(prompt, num_inference_steps)
+
+            # record latents if present
+            latents = None
+            if hasattr(result, "latents"):
+                latents = result.latents
+            elif hasattr(result, "arrays") and isinstance(result.arrays, dict):
+                latents = result.arrays.get("latents")
+
+            if latents is not None:
+                lat = np.array(latents)
+                if lat.ndim >= 4:
+                    for s in range(lat.shape[0]):
+                        self.capture.record(lat[s])
+                else:
+                    self.capture.record(lat)
+
+            return getattr(result, "image", None)
+
+        return None
+
+    def get_trajectory(self) -> List[np.ndarray]:
+        return self.capture.get_trajectory()

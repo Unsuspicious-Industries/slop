@@ -1,4 +1,4 @@
-numpy
+numpy<2.0.0
 scipy
 scikit-learn
 umap-learn
@@ -8,12 +8,9 @@ plotly
 streamlit
 torch
 torchvision
-transformers
-diffusers
+transformers<5.0.0
+diffusers==0.29.0
 accelerate
-torchvision
-streamlit
-plotly
 opencv-python
 Pillow
 jsonlines
@@ -21,3 +18,4 @@ tqdm
 pyyaml
 types-PyYAML
 einops
+safetensors

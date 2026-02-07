@@ -1,0 +1,29 @@
+Bootstrap: docker
+From: pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+
+%post
+    # Install system dependencies if needed (usually covered by base, but git is good)
+    apt-get update && apt-get install -y git
+
+    # Install Python dependencies
+    # We list them explicitly to avoid copying requirements.txt into the build context
+    pip install --no-cache-dir \
+        diffusers \
+        transformers \
+        accelerate \
+        scipy \
+        scikit-learn \
+        einops \
+        ftfy \
+        regex \
+        Pillow
+
+%environment
+    # Set environment variables
+    export LC_ALL=C
+    export HF_HOME=/tmp/huggingface
+
+%labels
+    Author SLOP_Team
+    Version v1.0
+    Description SLOP Inference Container

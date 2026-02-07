@@ -1,243 +1,117 @@
-# SLOP Deployment Guide
+# Deployment Guide
 
-Easy deployment and testing for remote servers and local development.
+This guide explains how to deploy the **Racist Currents (SLOP)** inference server to a remote HPC cluster or GPU workstation.
 
-## Quick Start
+## Architecture
 
-### Local Testing
+*   **Local Machine (Client):** Runs the Python interface, sends prompts, and analyzes results.
+*   **Remote Machine (Server):** Runs a Singularity container with PyTorch/Diffusers, executes generation, and returns data via SSH.
 
-```bash
-# Run quick tests (fast, no model downloads)
-python -m pytest tests/ -v
+---
 
-# Run with real models (slow, downloads models)
-python -m pytest tests/ -v --run-slow
+## 1. Remote Preparation (HPC/GPU Node)
 
-# Run GPU tests
-python -m pytest tests/ -v --run-gpu
-```
+The remote machine needs **Singularity (or Apptainer)** installed.
 
-### Test Structure
+### A. Build the Container
+You usually need to build the container image (`.sif`) on a Linux machine where you have `sudo` access (or use `--fakeroot`).
 
-- `tests/test_latent_extraction.py` - CLIP, DINOv2, embedding extraction
-- `tests/test_diffusion_flow.py` - Stable Diffusion, FLUX, trajectory capture
-- `tests/test_flow_analysis.py` - Physics operators, topology, flow fields
-- `tests/conftest.py` - Shared fixtures and configuration
+1.  **Transfer the definition file:**
+    ```bash
+    scp containers/slop.def user@remote-host:~/
+    ```
 
-## Remote Server Deployment
+2.  **Build the image:**
+    ```bash
+    # On the remote machine (or a build node)
+    apptainer build slop.sif slop.def
+    # OR
+    sudo singularity build slop.sif slop.def
+    ```
 
-### Option 1: Direct Deployment (Recommended)
+3.  **Note the path:**
+    Ideally, place the final `slop.sif` in `~/slop/containers/slop.sif` on the remote host, or note its location.
 
-```bash
-# Deploy to remote server
-./scripts/deploy.sh user@server:/path/to/deploy
+---
 
-# Or manually:
-ssh user@server
-cd /path/to/deploy
-./scripts/setup_remote.sh
-```
+## 2. Local Setup (Client)
 
-### Option 2: Docker Deployment
+1.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-```bash
-# Build Docker image
-python scripts/docker_deploy.py build
+2.  **Configure SSH:**
+    Ensure you can SSH into the remote host without a password (use an SSH key):
+    ```bash
+    ssh-copy-id user@remote-host
+    ```
 
-# Run analysis in container
-python scripts/docker_deploy.py run --mode quick --gpu
-python scripts/docker_deploy.py run --mode full --prompts "cat,dog,bird"
-```
+---
 
-## Running Analysis
+## 3. Deployment
 
-### Quick Analysis (Fast, 5 min)
+We use the `client.deploy` tool to push the codebase and register the server configuration locally.
 
-```bash
-source .venv/bin/activate
-python scripts/run_remote_analysis.py --mode quick
-```
-
-### Full Analysis (Comprehensive, 30-60 min)
+**Scenario A: Standard Deployment (Recommended)**
+This copies the code to `~/slop` on the remote and assumes the container is at `~/slop/containers/slop.sif`.
 
 ```bash
-python scripts/run_remote_analysis.py \
-    --mode full \
-    --prompts "a cat,a dog,a bird" \
-    --num-trajectories 20 \
-    --steps 50 \
-    --output outputs/my_analysis
+# 1. Upload your locally built container (if you built it locally)
+# rsync -av containers/slop.sif user@remote-host:~/slop/containers/
+
+# 2. Deploy code and register
+python3 -m client.deploy user@remote-host --path ~/slop
 ```
 
-### Generate Trajectories Only
+**Scenario B: Custom Container Path**
+If your `.sif` file is in a shared directory (e.g., `/shared/images/slop.sif`):
 
 ```bash
-python scripts/run_remote_analysis.py \
-    --mode trajectories \
-    --prompts "test prompt" \
-    --num-trajectories 10 \
-    --output outputs/trajectories
+python3 -m client.deploy user@remote-host \
+    --path ~/slop \
+    --container /shared/images/slop.sif \
+    --name my-gpu-node
 ```
 
-### Analyze Existing Trajectories
+---
+
+## 4. Verification
+
+Run the management tool to check connection and run a sanity test.
 
 ```bash
-python scripts/run_remote_analysis.py \
-    --mode analysis \
-    --output outputs/analysis_results
+# List registered servers
+python3 -m client.manage list
+
+# Check connection
+python3 -m client.manage check
+
+# Run a quick compute verification (generates 1 step)
+python3 -m client.manage check --verify
 ```
 
-## Configuration
+If you see `Status: ONLINE` and `Compute: OK`, you are ready.
 
-Edit `config.yaml` to set default parameters:
+---
 
-```yaml
-model:
-  diffusion: "CompVis/stable-diffusion-v1-4"
-  clip: "openai/clip-vit-base-patch32"
-  device: "cuda"
+## 5. Usage
 
-generation:
-  num_trajectories: 20
-  num_steps: 50
-  resolution: 512
-
-analysis:
-  grid_resolution: 50
-  radius: 0.8
-```
-
-## Output Structure
-
-```
-outputs/
-├── trajectories/          # Generated trajectories
-│   ├── trajectory_000.npy
-│   └── ...
-├── flow/                  # Flow field data
-│   ├── flow_field_2d_velocity.npy
-│   ├── flow_field_2d_divergence.npy
-│   └── flow_field_2d_vorticity.npy
-├── analysis/              # Analysis results
-│   ├── statistics.json
-│   ├── topology.json
-│   ├── velocity.npy
-│   └── divergence.npy
-└── summary.json           # Overall summary
-```
-
-## Server Requirements
-
-### Minimum
-- Python 3.8+
-- 8GB RAM
-- 10GB disk space
-
-### Recommended
-- NVIDIA GPU (8GB+ VRAM)
-- 16GB RAM
-- 50GB disk space
-- CUDA 11.8+
-
-## Testing on Remote Server
-
-```bash
-# SSH into server
-ssh user@server
-cd /path/to/slop
-
-# Activate environment
-source .venv/bin/activate
-
-# Run quick test
-python -m pytest tests/test_flow_analysis.py -v
-
-# Run full test suite (no model downloads)
-python -m pytest tests/ -v -k "not slow"
-
-# Run with models (downloads ~5GB)
-python -m pytest tests/test_latent_extraction.py -v --run-slow
-```
-
-## Monitoring
-
-```bash
-# Check GPU usage
-nvidia-smi
-
-# Monitor logs
-tail -f outputs/my_analysis/analysis.log
-
-# Check results
-cat outputs/my_analysis/summary.json
-```
-
-## Troubleshooting
-
-### Out of Memory
-
-Reduce batch size or resolution:
-```bash
-python scripts/run_remote_analysis.py \
-    --mode quick \
-    --resolution 256 \
-    --num-trajectories 5
-```
-
-### Slow on CPU
-
-Use smaller models or Docker with GPU:
-```bash
-python scripts/docker_deploy.py run --mode quick --gpu
-```
-
-### Model Download Issues
-
-Set Hugging Face cache:
-```bash
-export HF_HOME=/path/to/cache
-export TRANSFORMERS_CACHE=/path/to/cache
-```
-
-## Advanced Usage
-
-### Custom Analysis Pipeline
+Use the Python API in your notebooks or scripts:
 
 ```python
-from src.utils.ai import AILoader
-from src.utils.tasks import TaskRunner
-from src.utils.physics import PhysicsTools
+from client.interface import SlopClient
+from client.config import registry
 
-# Load models
-ai = AILoader(device="cuda")
-ai.load_diffusion()
+# Load the config we just deployed
+config = registry.get("my-gpu-node")
 
-# Generate trajectories
-runner = TaskRunner(device="cuda")
-result = runner.generate_trajectories(
-    prompts=["test"],
-    num_trajectories=10
-)
-
-# Analyze
-physics = PhysicsTools()
-from src.analysis.flow_fields import compute_flow_field
-
-grid, V = compute_flow_field(result['trajectories'])
-stats = physics.compute_flow_statistics(V)
-topology = physics.analyze_topology(V)
+with SlopClient(config) as client:
+    result = client.generate(
+        prompt="A photograph of a CEO",
+        num_steps=50,
+        capture_latents=True
+    )
+    
+    print(f"Received image: {len(result.image)} bytes")
 ```
-
-## Performance Tips
-
-1. **Use GPU**: 10-50x faster than CPU
-2. **Batch processing**: Process multiple prompts together
-3. **Cache models**: Set `HF_HOME` to persistent directory
-4. **Reduce resolution**: Use 256 or 512 instead of 1024
-5. **Parallel generation**: Generate trajectories in parallel
-
-## Support
-
-- Check logs in `outputs/*/analysis.log`
-- Run tests to verify setup: `pytest tests/ -v`
-- Check GPU: `nvidia-smi`

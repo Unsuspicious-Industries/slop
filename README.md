@@ -1,24 +1,64 @@
-Racist Currents
-===============
+# SLOP: Vector Field Analysis for Diffusion Bias
 
-Framework d'analyse des biais latents dans les modèles de diffusion et VLMs. Le but principal ici est de **produire des visualisations** qui révèlent comment les modèles modernes réactivent des motifs visuels hérités de l'imagerie coloniale. La collecte/encodage est possible mais doit rester minimale; la priorité est le tooling léger, hackable et détournable pour explorer rapidement l'espace latent et les courants biaisés.
+**SLOP** (Server-Local Operations for Physics) is a tool for analyzing latent biases in diffusion models using physics-based vector fields. It is designed to run in restricted HPC environments (Singularity containers, no root, no open ports) by tunneling a custom binary protocol over SSH.
 
-## Contenu
-- Extraction/agrégation d'embeddings multi-modèles (CLIP, DINOv2) pour servir les viz.
-- Hooks de capture pour trajectoires de débruitage (Stable Diffusion, Flux) — optionnels, plug-and-play.
-- Analyses prêtes pour la viz: clustering stéréotypé, distances, champs de flux, attracteurs.
-- Visualisations essentielles: espace latent, trajectoires, champs vectoriels, heatmaps; scripts prêts (`scripts/`).
+## Architecture
 
-## Démarrage rapide (focus viz)
-1) Créer un environnement Python 3.10+.
-2) `pip install -r requirements.txt`.
-3) Placer des embeddings / trajectoires existants (ou générer vite fait) dans `data/historical/embeddings/` et `data/generated/trajectories/`.
-4) Configurer `config.yaml` si besoin.
-5) Lancer des viz directement :
-   - `python scripts/viz_embedding_space.py --historical data/historical/embeddings/embeddings.npy --modern data/generated/embeddings.npy --out outputs/figures/embedding_space.png`
-   - `python scripts/viz_flow_fields.py --trajectories data/generated/trajectories --poles outputs/stereotype_poles.npy --out outputs/figures/flow_field.png`
-   - `python scripts/viz_trajectories.py --trajectories data/generated/trajectories --poles outputs/stereotype_poles.npy --out outputs/figures/trajectories.png`
-    - Interface live : `streamlit run src/visualization/interface_app.py`
+*   **Server (`server/`)**: Runs inside a container on a GPU node. Listens on `stdin`, writes to `stdout`.
+    *   Zero-dependency protocol (JSON over pipe).
+    *   Stateful inference runner with support for Stable Diffusion and Flux.
+    *   Hooks into model execution to capture latents, noise predictions, and embeddings.
+*   **Client (`client/`)**: Runs on your local machine.
+    *   Manages SSH tunnels transparently.
+    *   Provides a CLI for deployment and health checks.
+    *   Performs physics analysis (vector field interpolation, critical point detection) and visualization.
+*   **Shared (`shared/`)**:
+    *   Protocol definitions and serialization.
+    *   Core physics math (numpy-only).
 
-## Arborescence
-Voir `config.yaml` et les modules dans `src/` pour la structure détaillée. Les scripts sous `scripts/` produisent les visualisations à partir de données déjà présentes.
+## Getting Started
+
+### 1. Prerequisites
+*   **Local:** Python 3.9+
+*   **Remote:** Python 3.9+, SSH access, GPU
+
+### 2. Deploy to Remote
+Push the code to your HPC node. This copies the necessary `server` and `shared` code.
+
+```bash
+# Syntax: python -m client.deploy user@host --path /remote/path --name alias
+python -m client.deploy user@login.cluster.edu --path /scratch/user/slop --name cluster-a
+```
+
+### 3. Check Connection
+Verify the server is reachable and the GPU is detected.
+
+```bash
+python -m client.manage check cluster-a
+```
+
+To run a quick generation test (verifies CUDA and model loading):
+
+```bash
+python -m client.manage check cluster-a --verify
+```
+
+### 4. Run Analysis (Coming Soon)
+(This section will describe how to use `client.interface` to run full experiments).
+
+## Development
+
+### Directory Structure
+```
+├── client/          # Local tools (CLI, visualization, transport)
+├── server/          # Remote code (inference engine, daemon)
+├── shared/          # Common protocol and physics logic
+├── containers/      # Singularity/Apptainer definition files
+└── data/            # Local data storage
+```
+
+### Protocol
+The communication uses a length-prefixed JSON protocol over standard I/O.
+*   **Request:** `[4-byte Len] { "kind": "inference", ... }`
+*   **Response:** `[4-byte Len] { "kind": "result", "payload": { ... } }`
+*   **Binary Data:** Numpy arrays and images are zlib-compressed and Base64-encoded within the JSON payload.
