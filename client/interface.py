@@ -30,13 +30,13 @@ class TrajectoryStep:
     
     Attributes:
         step_index: Which step this is (0 to num_steps)
-        timestep: The scheduler timestep value (int, usually 0-1000)
+        timestep: The scheduler timestep value (float, usually 0-1000 for SD, 0-1 for Flux)
         latent: The latent representation at this step. Shape: (batch, channels, height, width)
         noise_pred: The model's predicted noise. Shape: (batch, channels, height, width)
         prompt_embedding: Text conditioning embeddings. Shape: (batch, seq_len, hidden_dim)
     """
     step_index: int
-    timestep: int
+    timestep: float
     latent: np.ndarray
     noise_pred: np.ndarray
     prompt_embedding: np.ndarray
@@ -177,7 +177,7 @@ class InferenceResult:
         for i in range(num_steps):
             step = TrajectoryStep(
                 step_index=i,
-                timestep=int(self.timesteps[i]) if self.timesteps is not None and i < len(self.timesteps) else 0,
+                timestep=float(self.timesteps[i]) if self.timesteps is not None and i < len(self.timesteps) else 0.0,
                 latent=self.latents[i],
                 noise_pred=self.noise_preds[i] if self.noise_preds is not None and i < len(self.noise_preds) else np.array([]),
                 prompt_embedding=self.prompt_embeds[0] if self.prompt_embeds is not None else np.array([])
@@ -274,7 +274,8 @@ class SlopClient:
         model_id: str = "runwayml/stable-diffusion-v1-5",
         capture_latents: bool = True,
         capture_noise: bool = True,
-        capture_timesteps: bool = True
+        capture_timesteps: bool = True,
+        capture_prompt_embeds: bool = False
     ) -> InferenceResult:
         """Run a generation job on the remote server.
         
@@ -290,6 +291,7 @@ class SlopClient:
             capture_latents: If True, captures latent at EVERY step (default: True)
             capture_noise: If True, captures noise predictions at every step (default: True)
             capture_timesteps: If True, captures scheduler timestep values (default: True)
+            capture_prompt_embeds: If True, captures text embeddings (default: False)
             
         Returns:
             InferenceResult containing:
@@ -327,7 +329,8 @@ class SlopClient:
             model_id=model_id,
             capture_latents=capture_latents,
             capture_noise_pred=capture_noise,
-            capture_timesteps=capture_timesteps
+            capture_timesteps=capture_timesteps,
+            capture_prompt_embeds=capture_prompt_embeds
         )
         
         resp = self.transport.send_request(req)
@@ -353,7 +356,183 @@ class SlopClient:
         self.close()
 
     # --------------------------------------------------------------------------
-    # Batch Generation
+    # Prompt Embedding Extraction
+    # --------------------------------------------------------------------------
+
+    def get_prompt_embeds(
+        self,
+        prompts: 'Union[str, List[str]]',
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+    ) -> np.ndarray:
+        """Encode text prompts through the diffusion model's text encoder.
+
+        Returns the prompt embeddings that would normally be fed to the UNet.
+        These can be manipulated (e.g. adding identity vectors) and passed
+        back via generate_with_embeds() to bypass the text encoder entirely.
+
+        Args:
+            prompts: Single string or list of strings to encode
+            model_id: Which model's text encoder to use
+
+        Returns:
+            If single string: (1, seq_len, hidden_dim) numpy array
+            If list: (n_prompts, seq_len, hidden_dim) numpy array
+        """
+        from shared.protocol.messages import EncodeRequest, MessageKind, ErrorResponse, JobResult
+        from shared.protocol.serialization import unpack_array
+
+        self.connect()
+
+        single = isinstance(prompts, str)
+        texts = [prompts] if single else prompts
+
+        req = EncodeRequest(
+            model_id=model_id,
+            modality="text",
+            inputs=texts,
+        )
+
+        resp = self.transport.send_request(req)
+
+        if isinstance(resp, ErrorResponse):
+            raise RuntimeError(f"Encode failed: {resp.error}")
+        if not isinstance(resp, JobResult):
+            raise RuntimeError(f"Unexpected response: {type(resp)}")
+
+        if "prompt_embeds" in resp.arrays:
+            embeds = unpack_array(resp.arrays["prompt_embeds"])
+            return embeds
+
+        raise RuntimeError("No prompt_embeds in response")
+
+    # --------------------------------------------------------------------------
+    # Embedding-Override Generation
+    # --------------------------------------------------------------------------
+
+    def generate_with_embeds(
+        self,
+        prompt_embeds: np.ndarray,
+        negative_prompt_embeds: 'Optional[np.ndarray]' = None,
+        num_steps: int = 50,
+        guidance_scale: float = 7.5,
+        seed: int = -1,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+        capture_latents: bool = True,
+        capture_noise: bool = True,
+        capture_timesteps: bool = True,
+    ) -> InferenceResult:
+        """Generate an image using pre-computed prompt embeddings.
+
+        Instead of sending a text prompt (which the server would encode),
+        this sends the embeddings directly. This is used for identity-vector
+        experiments where we want the ONLY difference between categories
+        to be a computed direction vector in embedding space.
+
+        Args:
+            prompt_embeds: (1, seq_len, hidden_dim) numpy array
+            negative_prompt_embeds: (1, seq_len, hidden_dim) for CFG.
+                                    If None, server encodes empty string.
+            num_steps: Number of denoising steps
+            guidance_scale: CFG scale
+            seed: Random seed (-1 = random)
+            model_id: HuggingFace model ID
+            capture_latents: Capture full trajectory
+            capture_noise: Capture noise predictions
+            capture_timesteps: Capture scheduler timesteps
+
+        Returns:
+            InferenceResult (same as generate())
+        """
+        from shared.protocol.serialization import pack_array
+
+        self.connect()
+
+        # Pack embeddings for wire transfer
+        pe_packed = pack_array(prompt_embeds.astype(np.float32), compress=True, half=False)
+        npe_packed = None
+        if negative_prompt_embeds is not None:
+            npe_packed = pack_array(negative_prompt_embeds.astype(np.float32), compress=True, half=False)
+
+        req = InferenceRequest(
+            prompt="",  # empty — embeddings override
+            num_steps=num_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            model_id=model_id,
+            capture_latents=capture_latents,
+            capture_noise_pred=capture_noise,
+            capture_timesteps=capture_timesteps,
+            prompt_embeds_override=pe_packed,
+            negative_prompt_embeds_override=npe_packed,
+        )
+
+        resp = self.transport.send_request(req)
+
+        if isinstance(resp, ErrorResponse):
+            raise RuntimeError(f"Inference failed: {resp.error}\n{resp.traceback}")
+        if not isinstance(resp, JobResult):
+            raise RuntimeError(f"Unexpected response: {resp}")
+
+        return InferenceResult.from_job_result(resp)
+
+    def generate_batch_with_embeds(
+        self,
+        prompt_embeds: np.ndarray,
+        negative_prompt_embeds: 'Optional[np.ndarray]' = None,
+        n_variations: int = 20,
+        num_steps: int = 50,
+        guidance_scale: float = 7.5,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+        seed_start: int = 0,
+        capture_latents: bool = True,
+        capture_noise: bool = True,
+        progress: bool = True,
+    ) -> List[InferenceResult]:
+        """Generate multiple variations from the same embeddings with different seeds.
+
+        Identical to generate_batch() but uses pre-computed embeddings instead
+        of a text prompt. Each variation uses seed_start + i.
+
+        Args:
+            prompt_embeds: (1, seq_len, hidden_dim) — the conditioned embedding
+            negative_prompt_embeds: (1, seq_len, hidden_dim) — for CFG
+            n_variations: Number of variations
+            num_steps: Denoising steps per generation
+            guidance_scale: CFG scale
+            model_id: HuggingFace model ID
+            seed_start: Starting seed
+            capture_latents: Capture full trajectory
+            capture_noise: Capture noise predictions
+            progress: Print progress
+
+        Returns:
+            List of InferenceResult, one per variation
+        """
+        results = []
+        for i in range(n_variations):
+            if progress:
+                print(f"  [{i+1}/{n_variations}] seed={seed_start + i}", end="... ", flush=True)
+
+            result = self.generate_with_embeds(
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                num_steps=num_steps,
+                guidance_scale=guidance_scale,
+                seed=seed_start + i,
+                model_id=model_id,
+                capture_latents=capture_latents,
+                capture_noise=capture_noise,
+            )
+            results.append(result)
+
+            if progress:
+                elapsed = result.metadata.get('elapsed_s', 0)
+                print(f"{elapsed:.1f}s")
+
+        return results
+
+    # --------------------------------------------------------------------------
+    # Batch Generation (text prompt)
     # --------------------------------------------------------------------------
 
     def generate_batch(

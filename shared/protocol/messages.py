@@ -84,6 +84,12 @@ class InferenceRequest(Request):
     latent_sample_rate: int = 1       # capture every N steps
     compress_latents: bool = True     # float16 + zlib
 
+    # Embedding overrides — bypass text encoder, inject embeddings directly.
+    # Values are packed-array dicts from shared.protocol.serialization.pack_array.
+    # When set, the server skips text encoding and uses these embeddings for the UNet.
+    prompt_embeds_override: Optional[Dict[str, Any]] = None
+    negative_prompt_embeds_override: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class EncodeRequest(Request):

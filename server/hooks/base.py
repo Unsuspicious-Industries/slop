@@ -69,21 +69,26 @@ class BaseTrajectoryHook(ABC):
 
     def generate_with_tracking(
         self, 
-        prompt: str, 
+        prompt: Optional[str] = None, 
         num_steps: int = 50, 
         **kwargs
     ) -> Tuple[Any, List[Dict[str, Any]]]:
         """Run generation and return result + trajectories.
         
         Args:
-            prompt: Text prompt
+            prompt: Text prompt. If None, prompt_embeds must be in kwargs
+                    (embedding-override mode — bypasses text encoder).
             num_steps: Inference steps
-            **kwargs: Passed to pipe (e.g. guidance_scale, seed, etc.)
+            **kwargs: Passed to pipe (e.g. guidance_scale, prompt_embeds, etc.)
         """
         self.trajectories = []
         self.hook_model()
         try:
-            output = self.pipe(prompt, num_inference_steps=num_steps, **kwargs)
+            if prompt is not None:
+                output = self.pipe(prompt, num_inference_steps=num_steps, **kwargs)
+            else:
+                # Embedding-override mode: prompt_embeds should be in kwargs
+                output = self.pipe(num_inference_steps=num_steps, **kwargs)
             # Handle standard diffusers output
             image = output.images[0] if hasattr(output, 'images') else output
         finally:

@@ -26,12 +26,259 @@ Shapes reference (SD v1.5 @ 512×512):
 
 from __future__ import annotations
 
+import csv
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 from sklearn.decomposition import PCA
+
+
+# =====================================================================
+#  IDENTITY VECTOR INFRASTRUCTURE
+# =====================================================================
+# Instead of using different text prompts (which introduces tokenization
+# artifacts and contextual variation from the text encoder), we compute
+# a FIXED direction vector per identity in prompt-embedding space:
+#
+#     arab_vector = encode("Arab person") − encode("a person")
+#
+# Then for ANY theme:
+#     conditioned = encode("daily life in Jaffa") + arab_vector
+#
+# This gives perfect experimental control: the ONLY difference between
+# categories is the identity vector.  No text encoder variability.
+#
+# The vectors can also be scaled: base + α × identity_vector, letting
+# us sweep identity "strength" continuously.
+
+@dataclass
+class IdentityVectorSet:
+    """Pre-computed identity direction vectors in prompt embedding space.
+
+    Created by compute_identity_vectors(), saved/loaded for reuse across
+    sessions.
+
+    Attributes:
+        vectors: {"arab": (1, seq_len, hidden_dim), ...} — direction per identity
+        anchor_embed: (1, seq_len, hidden_dim) — the neutral anchor encoding
+        negative_embed: (1, seq_len, hidden_dim) — empty-string encoding (for CFG)
+        anchor_phrase: e.g. "a person"
+        identity_phrases: {"arab": "Arab person", ...}
+        model_id: Which model's text encoder was used
+    """
+    vectors: Dict[str, np.ndarray]
+    anchor_embed: np.ndarray
+    negative_embed: np.ndarray
+    anchor_phrase: str
+    identity_phrases: Dict[str, str]
+    model_id: str
+
+    @property
+    def embed_shape(self) -> tuple:
+        """Shape of a single embedding: (1, seq_len, hidden_dim)."""
+        return self.anchor_embed.shape
+
+    @property
+    def identity_names(self) -> List[str]:
+        """Available identity names."""
+        return list(self.vectors.keys())
+
+    def save(self, path: str):
+        """Persist to disk for reuse across sessions."""
+        import json
+        out = Path(path)
+        out.mkdir(parents=True, exist_ok=True)
+        np.save(out / "anchor_embed.npy", self.anchor_embed)
+        np.save(out / "negative_embed.npy", self.negative_embed)
+        for name, vec in self.vectors.items():
+            np.save(out / f"identity_vec_{name}.npy", vec)
+        with open(out / "metadata.json", "w") as f:
+            json.dump({
+                "anchor_phrase": self.anchor_phrase,
+                "identity_phrases": self.identity_phrases,
+                "model_id": self.model_id,
+                "vector_names": list(self.vectors.keys()),
+                "embed_shape": list(self.anchor_embed.shape),
+            }, f, indent=2)
+        print(f"Saved identity vectors to {out}")
+
+    @classmethod
+    def load(cls, path: str) -> "IdentityVectorSet":
+        """Load from disk."""
+        import json
+        p = Path(path)
+        with open(p / "metadata.json") as f:
+            meta = json.load(f)
+        anchor = np.load(p / "anchor_embed.npy")
+        negative = np.load(p / "negative_embed.npy")
+        vectors = {}
+        for name in meta["vector_names"]:
+            vectors[name] = np.load(p / f"identity_vec_{name}.npy")
+        return cls(
+            vectors=vectors,
+            anchor_embed=anchor,
+            negative_embed=negative,
+            anchor_phrase=meta["anchor_phrase"],
+            identity_phrases=meta["identity_phrases"],
+            model_id=meta["model_id"],
+        )
+
+
+def compute_identity_vectors(
+    client,
+    identities: Dict[str, str],
+    anchor: str = "a person",
+    model_id: str = "runwayml/stable-diffusion-v1-5",
+) -> IdentityVectorSet:
+    """Compute identity direction vectors in prompt embedding space.
+
+    For each identity phrase, computes:
+        vector = encode(phrase) − encode(anchor)
+
+    Also encodes the empty string for CFG negative conditioning.
+
+    All texts are encoded in a single server call for efficiency.
+
+    Args:
+        client: Connected SlopClient
+        identities: {"arab": "Arab person", "palestinian": "Palestinian person", ...}
+        anchor: Neutral anchor phrase (e.g. "a person")
+        model_id: Which model's text encoder to use
+
+    Returns:
+        IdentityVectorSet with computed vectors, anchor, and negative embed
+    """
+    # Encode all texts in one batch:  [anchor, "", id1, id2, ...]
+    all_texts = [anchor, ""] + list(identities.values())
+    all_embeds = client.get_prompt_embeds(all_texts, model_id=model_id)
+    # all_embeds: (n_texts, seq_len, hidden_dim)
+
+    anchor_embed = all_embeds[0:1]       # (1, seq_len, hidden_dim)
+    negative_embed = all_embeds[1:2]     # (1, seq_len, hidden_dim)
+
+    vectors = {}
+    for i, (name, phrase) in enumerate(identities.items()):
+        id_embed = all_embeds[2 + i : 3 + i]  # (1, seq_len, hidden_dim)
+        vectors[name] = id_embed - anchor_embed
+
+    return IdentityVectorSet(
+        vectors=vectors,
+        anchor_embed=anchor_embed,
+        negative_embed=negative_embed,
+        anchor_phrase=anchor,
+        identity_phrases=identities,
+        model_id=model_id,
+    )
+
+
+def build_conditioned_embeds(
+    base_embed: np.ndarray,
+    identity_vectors: IdentityVectorSet,
+    categories: Optional[List[str]] = None,
+    scale: float = 1.0,
+) -> Dict[str, np.ndarray]:
+    """Build identity-conditioned embeddings for generation.
+
+    For each category:
+        conditioned = base_embed + scale × identity_vector
+
+    "neutral" uses base_embed unmodified (zero vector added).
+
+    Args:
+        base_embed: (1, seq_len, hidden_dim) — the theme/scene embedding
+        identity_vectors: Pre-computed IdentityVectorSet
+        categories: Which identities to include (default: all + neutral)
+        scale: Scaling factor for identity vectors (1.0 = full strength)
+
+    Returns:
+        {"neutral": base_embed, "arab": base + α×arab_vec, ...}
+    """
+    if categories is None:
+        categories = list(identity_vectors.vectors.keys())
+
+    result = {"neutral": base_embed.copy()}
+    for name in categories:
+        if name == "neutral":
+            continue
+        if name not in identity_vectors.vectors:
+            raise ValueError(
+                f"Identity '{name}' not in vector set. "
+                f"Available: {list(identity_vectors.vectors.keys())}"
+            )
+        result[name] = base_embed + scale * identity_vectors.vectors[name]
+
+    return result
+
+
+def sweep_identity_strength(
+    base_embed: np.ndarray,
+    identity_vector: np.ndarray,
+    scales: Optional[List[float]] = None,
+) -> Dict[float, np.ndarray]:
+    """Generate embeddings at varying identity vector strengths.
+
+    Useful for finding the threshold where colonial imagery appears,
+    or for creating smooth interpolations.
+
+    Args:
+        base_embed: (1, seq_len, hidden_dim) — theme embedding
+        identity_vector: (1, seq_len, hidden_dim) — identity direction
+        scales: List of α values (default: 0.0 to 2.0 in 0.25 steps)
+
+    Returns:
+        {scale: conditioned_embed} dict
+    """
+    if scales is None:
+        scales = [0.0, 0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
+
+    return {s: base_embed + s * identity_vector for s in scales}
+
+
+# ---------------------------------------------------------------------------
+# Data Loading
+# ---------------------------------------------------------------------------
+
+def load_prompt_categories(csv_path: str) -> Dict[str, List[str]]:
+    """Load prompts and their categories from a CSV file.
+
+    Expected CSV format:
+        prompt,category
+        "a photo of...",neutral
+        "another photo...",arab
+
+    Args:
+        csv_path: Path to the CSV file.
+
+    Returns:
+        Dictionary mapping category names to lists of prompts.
+    """
+    categories = defaultdict(list)
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            # Detect header to be safe, or just assume format
+            reader = csv.DictReader(f)
+            if 'prompt' not in reader.fieldnames or 'category' not in reader.fieldnames:
+                 # Fallback for simple csv without header or check headers
+                 pass
+            
+            for row in reader:
+                # Normalize keys (strip whitespace, lowercase)
+                clean_row = {k.strip().lower(): v.strip() for k, v in row.items()}
+                
+                prompt = clean_row.get('prompt') or clean_row.get('text')
+                category = clean_row.get('category') or clean_row.get('label')
+                
+                if prompt and category:
+                    categories[category].append(prompt)
+    except Exception as e:
+        print(f"Error loading CSV: {e}")
+        # Return empty or re-raise depending on strictness. 
+        # For now, let's assume valid file or empty.
+        
+    return dict(categories)
 
 
 # ---------------------------------------------------------------------------
@@ -665,8 +912,9 @@ def compare_divergence_rates(
                 diff = ra[:n_common] - rb[:n_common]  # (N, T) — positive = a diverges faster
                 mean_diff = diff.mean(axis=0)
                 sem_diff = _sem(diff)
-                # t-statistic per step
-                t_stat = np.where(sem_diff > 1e-10, mean_diff / sem_diff, 0.0)
+                # t-statistic per step (safe division)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    t_stat = np.where(sem_diff > 1e-10, mean_diff / sem_diff, 0.0)
                 pairwise[f"{ca}_vs_{cb}"] = {
                     "mean_rate_diff": mean_diff,
                     "sem": sem_diff,
@@ -877,7 +1125,9 @@ def extract_motif_components(
     pca = PCA(n_components=min(n_components, n, diffs.shape[1]))
     pca.fit(diffs)
 
-    C, H, W = stacks_with[0][0].shape[1], stacks_with[0][0].shape[3], stacks_with[0][0].shape[4]
+    # Recover spatial shape from a single step: (batch, C, H, W)
+    step_shape = stacks_with[0][0].shape  # (batch, C, H, W)
+    C, H, W = step_shape[-3], step_shape[-2], step_shape[-1]
     components = pca.components_.reshape(-1, C, H, W)
 
     return components, pca, pca.explained_variance_ratio_

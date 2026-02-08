@@ -8,8 +8,8 @@ plotly
 streamlit
 torch
 torchvision
-transformers<5.0.0
-diffusers==0.29.0
+transformers>=4.43.0
+diffusers==0.31.0
 accelerate
 opencv-python
 Pillow
@@ -19,3 +19,5 @@ pyyaml
 types-PyYAML
 einops
 safetensors
+sentencepiece
+protobuf

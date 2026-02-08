@@ -6,8 +6,8 @@ import base64
 from PIL import Image
 from typing import Optional, Any
 
-from shared.protocol.messages import InferenceRequest, JobResult
-from shared.protocol.serialization import pack_array
+from shared.protocol.messages import InferenceRequest, EncodeRequest, JobResult
+from shared.protocol.serialization import pack_array, unpack_array
 from server.inference.loaders import load_diffusion_model
 from server.hooks.sd import SDTrajectoryHook
 from server.hooks.flux import FluxTrajectoryHook
@@ -19,19 +19,70 @@ class InferenceRunner:
         self.current_model_id: Optional[str] = None
         self.pipe: Any = None
         
+    def _ensure_model(self, model_id: str):
+        """Ensure the requested model is loaded, switching if needed."""
+        if model_id != self.current_model_id:
+            if self.pipe is not None:
+                del self.pipe
+                torch.cuda.empty_cache()
+            self.pipe = load_diffusion_model(model_id)
+            self.current_model_id = model_id
+
+    def _get_device(self):
+        """Get the device of the loaded pipeline."""
+        if hasattr(self.pipe, '_execution_device'):
+            return self.pipe._execution_device
+        if hasattr(self.pipe, 'device'):
+            return self.pipe.device
+        return torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    def encode_prompt(self, req: EncodeRequest) -> JobResult:
+        """Encode text prompts through the diffusion model's text encoder.
+
+        Returns the prompt embeddings that would be fed to the UNet,
+        without running any diffusion steps. Used for computing identity
+        vectors and embedding-override generation.
+        """
+        start_time = time.time()
+        self._ensure_model(req.model_id)
+
+        device = self._get_device()
+
+        embeddings = []
+        for text in req.inputs:
+            text_inputs = self.pipe.tokenizer(
+                text,
+                padding="max_length",
+                max_length=self.pipe.tokenizer.model_max_length,
+                truncation=True,
+                return_tensors="pt",
+            )
+            with torch.no_grad():
+                encoder_output = self.pipe.text_encoder(
+                    text_inputs.input_ids.to(device)
+                )
+                embed = encoder_output[0]  # last_hidden_state: (1, seq_len, hidden_dim)
+            embeddings.append(embed.cpu().float().numpy())
+
+        # Stack into (n_texts, seq_len, hidden_dim)
+        stacked = np.concatenate(embeddings, axis=0)
+
+        elapsed = time.time() - start_time
+
+        return JobResult(
+            job_id=req.job_id,
+            request_kind=req.kind,
+            model_id=req.model_id,
+            elapsed_s=elapsed,
+            payload={"n_texts": len(req.inputs)},
+            arrays={"prompt_embeds": pack_array(stacked, compress=True, half=False)},
+        )
+
     def run(self, req: InferenceRequest) -> JobResult:
         start_time = time.time()
         
         # 1. Load Model (Lazy / Switch)
-        if req.model_id != self.current_model_id:
-            # Free memory if switching
-            if self.pipe is not None:
-                del self.pipe
-                torch.cuda.empty_cache()
-            
-            # Load new model
-            self.pipe = load_diffusion_model(req.model_id)
-            self.current_model_id = req.model_id
+        self._ensure_model(req.model_id)
 
         # 2. Setup Hook
         if "flux" in req.model_id.lower():
@@ -41,9 +92,10 @@ class InferenceRunner:
 
         # 3. Run Inference
         # Convert seed to generator
+        device = self._get_device()
         generator = None
         if req.seed != -1:
-            generator = torch.Generator(device=self.pipe.device).manual_seed(req.seed)
+            generator = torch.Generator(device=device).manual_seed(req.seed)
 
         # Prepare kwargs
         kwargs = {
@@ -52,12 +104,48 @@ class InferenceRunner:
             "width": req.width,
             "generator": generator,
         }
-        if req.negative_prompt:
+        
+        # FLUX does not support negative_prompt natively in the standard pipeline
+        if "flux" not in req.model_id.lower() and req.negative_prompt:
             kwargs["negative_prompt"] = req.negative_prompt
+
+        # 3b. Handle prompt embedding overrides
+        # When set, we bypass the text encoder entirely and inject embeddings directly.
+        # This is used for identity-vector experiments where the ONLY difference
+        # between categories is a computed direction vector in embedding space.
+        use_embed_override = req.prompt_embeds_override is not None
+
+        if use_embed_override:
+            pe_np = unpack_array(req.prompt_embeds_override)
+            pe_tensor = torch.from_numpy(pe_np).to(device=device)
+            # Let the pipeline handle dtype conversion internally
+            kwargs["prompt_embeds"] = pe_tensor
+
+            if req.negative_prompt_embeds_override is not None:
+                npe_np = unpack_array(req.negative_prompt_embeds_override)
+                npe_tensor = torch.from_numpy(npe_np).to(device=device)
+                kwargs["negative_prompt_embeds"] = npe_tensor
+            else:
+                # Default: encode empty string for CFG unconditional
+                empty_inputs = self.pipe.tokenizer(
+                    "",
+                    padding="max_length",
+                    max_length=self.pipe.tokenizer.model_max_length,
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                with torch.no_grad():
+                    neg_embed = self.pipe.text_encoder(
+                        empty_inputs.input_ids.to(device)
+                    )[0]
+                kwargs["negative_prompt_embeds"] = neg_embed
+
+            # Don't pass negative_prompt when using embeds
+            kwargs.pop("negative_prompt", None)
 
         # Run!
         image, trajectories = hook.generate_with_tracking(
-            prompt=req.prompt,
+            prompt=req.prompt if not use_embed_override else None,
             num_steps=req.num_steps,
             **kwargs
         )
@@ -82,7 +170,8 @@ class InferenceRunner:
         
         if req.capture_timesteps and trajectories:
              # Extract timestep values from each trajectory entry
-             timesteps = np.array([t['timestep'] for t in trajectories], dtype=np.int32)
+             # Use float32 to support both SD (int-like floats) and FLUX (0.0-1.0 floats)
+             timesteps = np.array([t['timestep'] for t in trajectories], dtype=np.float32)
              arrays['timesteps'] = pack_array(timesteps, compress=False, half=False)
 
         # Convert image to bytes then base64

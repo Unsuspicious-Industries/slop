@@ -80,6 +80,17 @@ class ServerDaemon:
                 logger.info(f"Running inference: {req.prompt[:50]}...")
                 return self.runner.run(req)
                 
+            elif kind == MessageKind.ENCODE:
+                req = EncodeRequest.from_dict(req_dict)
+                if req.modality == "text":
+                    logger.info(f"Encoding {len(req.inputs)} text(s) via pipeline text encoder")
+                    return self.runner.encode_prompt(req)
+                else:
+                    return ErrorResponse(
+                        job_id=req_dict.get("job_id", ""),
+                        error=f"Unsupported encode modality: {req.modality}"
+                    )
+                
             elif kind == MessageKind.SHUTDOWN:
                 self.running = False
                 return Response(kind=MessageKind.INFO, job_id=req_dict.get("job_id", ""), elapsed_s=0)

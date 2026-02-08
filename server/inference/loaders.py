@@ -25,13 +25,32 @@ def load_diffusion_model(
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
 
     # Lazy imports to avoid hard deps at module import time
-    from diffusers import StableDiffusionPipeline
+    from diffusers import StableDiffusionPipeline, FluxPipeline
 
     pipe = None
     if "flux" in model_id.lower():
         try:
-            from diffusers import FluxPipeline
+            # FLUX generally requires bfloat16 for best performance/quality
+            if dtype == torch.float16 and torch.cuda.is_bf16_supported():
+                 dtype = torch.bfloat16
+            
+            # Hardware capability check for FLUX
+            if torch.cuda.is_available():
+                vram_bytes = torch.cuda.get_device_properties(0).total_memory
+                vram_gb = vram_bytes / (1024**3)
+                # FLUX.1-dev is very heavy. ~24GB recommended for comfortable inference.
+                # With aggressive offloading it might run on less, but we want to ensure stability.
+                if vram_gb < 16:
+                     raise RuntimeError(f"Insufficient VRAM for FLUX: {vram_gb:.1f}GB detected. ~24GB recommended.")
+            
             pipe = FluxPipeline.from_pretrained(model_id, torch_dtype=dtype)
+            
+            # For FLUX on consumer hardware (like 3090/4090), model cpu offload is often necessary
+            # or vastly more efficient than keeping it all in VRAM.
+            # We default to model_cpu_offload if not specified otherwise for FLUX.
+            if torch.cuda.is_available():
+                pipe.enable_model_cpu_offload()
+            
         except Exception as exc:
             raise RuntimeError(f"FluxPipeline unavailable or failed to load {model_id}: {exc}")
     else:
@@ -47,9 +66,12 @@ def load_diffusion_model(
         except Exception as exc:
              raise RuntimeError(f"StableDiffusionPipeline failed to load {model_id}: {exc}")
 
-    if sequential_offload and torch.cuda.is_available():
-        pipe.enable_sequential_cpu_offload()
-    else:
-        pipe.to(device)
+    # If we are using FLUX, we have already handled device placement via enable_model_cpu_offload
+    # For SD, we proceed with standard logic
+    if "flux" not in model_id.lower():
+        if sequential_offload and torch.cuda.is_available():
+            pipe.enable_sequential_cpu_offload()
+        else:
+            pipe.to(device)
 
     return pipe
