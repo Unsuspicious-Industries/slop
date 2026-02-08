@@ -1,7 +1,19 @@
 .mypy
 .venv
+.venv/
 .pytest*
-results/*
-**/__pycache__/*
-*/*.pyc
+.pytest_cache/
+.mypy_cache/
+.DS_Store
+.vscode/
+results/
+outputs/
+data/generated/
+**/__pycache__/
+**/*.pyc
+
+# Hugging Face token files
 .hf_token
+.hf_token*
+.hf/
+.huggingface/
