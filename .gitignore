@@ -2,3 +2,5 @@
 .venv
 .pytest*
 results/*
+**/__pycache__/*
+*/*.pyc
