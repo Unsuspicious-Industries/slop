@@ -1,4 +1,4 @@
-"""Test connection to a registered server."""
+"""Test connection to a registered provider."""
 import argparse
 import sys
 from pathlib import Path
@@ -9,16 +9,16 @@ sys.path.append(str(project_root))
 
 from client.config import registry
 from client.transport import SSHTransport, TransportError
-from shared.protocol.messages import Request, MessageKind
+from shared.protocol.messages import Request, MessageKind, ServerInfo
 
 def connect_and_test(name: str):
     config = registry.get(name)
     if not config:
-        print(f"Error: Server '{name}' not found in registry.")
-        print("Available servers:", ", ".join([s.name for s in registry.list()]))
+        print(f"Error: Provider '{name}' not found in registry.")
+        print("Available providers:", ", ".join([s.name for s in registry.list()]))
         sys.exit(1)
         
-    print(f"Connecting to '{name}' ({config.host})...")
+    print(f"Connecting to '{name}' ({config.target})...")
     
     transport = SSHTransport(config)
     
@@ -28,7 +28,9 @@ def connect_and_test(name: str):
         
         # Request Info
         print("Requesting server info...")
-        info = transport.send_request(Request(kind=MessageKind.SERVER_INFO))
+        info = transport.send_request(Request(kind=MessageKind.SERVER_INFO.value))
+        if not isinstance(info, ServerInfo):
+            raise TransportError(f"unexpected response: {type(info)}")
         
         print("\n=== Server Info ===")
         print(f"Hostname: {info.hostname}")
@@ -44,8 +46,8 @@ def connect_and_test(name: str):
         transport.close()
 
 def main():
-    parser = argparse.ArgumentParser(description="Connect to a registered SLOP server.")
-    parser.add_argument("name", help="Name of the server to connect to")
+    parser = argparse.ArgumentParser(description="Connect to a registered inference provider.")
+    parser.add_argument("name", help="Name of the provider to connect to")
     args = parser.parse_args()
     
     connect_and_test(args.name)

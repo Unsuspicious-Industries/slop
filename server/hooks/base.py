@@ -72,8 +72,8 @@ class BaseTrajectoryHook(ABC):
         prompt: Optional[str] = None, 
         num_steps: int = 50, 
         **kwargs
-    ) -> Tuple[Any, List[Dict[str, Any]]]:
-        """Run generation and return result + trajectories.
+    ) -> Tuple[List[Any], List[Dict[str, Any]]]:
+        """Run generation and return images + captured arrays.
         
         Args:
             prompt: Text prompt. If None, prompt_embeds must be in kwargs
@@ -89,9 +89,8 @@ class BaseTrajectoryHook(ABC):
             else:
                 # Embedding-override mode: prompt_embeds should be in kwargs
                 output = self.pipe(num_inference_steps=num_steps, **kwargs)
-            # Handle standard diffusers output
-            image = output.images[0] if hasattr(output, 'images') else output
+            images = list(output.images) if hasattr(output, 'images') else [output]
         finally:
             self.restore()
             
-        return image, self.trajectories
+        return images, self.trajectories

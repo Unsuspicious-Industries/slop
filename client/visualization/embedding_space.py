@@ -3,44 +3,43 @@ import numpy as np
 from umap import UMAP
 
 
-def plot_embedding_space(
-    historical_embs: np.ndarray,
-    modern_embs: np.ndarray | None = None,
-    labels: np.ndarray | None = None,
-    groups: np.ndarray | None = None,
-    color_by: str = "groups",
-):
-    if modern_embs is None:
-        all_embs = historical_embs
-    else:
-        all_embs = np.vstack([historical_embs, modern_embs])
+def _flatten(points: np.ndarray) -> np.ndarray:
+    arr = np.asarray(points, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr[:, None]
+    if arr.ndim > 2:
+        return arr.reshape(arr.shape[0], -1)
+    return arr
 
-    if len(all_embs) < 3:
-        reduced = all_embs[:, :2] if all_embs.shape[1] >= 2 else np.hstack([all_embs, np.zeros((len(all_embs), 1))])
-    else:
-        reducer = UMAP(n_components=2, n_neighbors=min(10, len(all_embs) - 1))
-        reduced = reducer.fit_transform(all_embs)
 
+def _reduce(points: np.ndarray) -> np.ndarray:
+    flat = _flatten(points)
+    if flat.shape[1] == 1:
+        return np.concatenate([flat, np.zeros((flat.shape[0], 1), dtype=flat.dtype)], axis=1)
+    if flat.shape[1] == 2 or flat.shape[0] < 3:
+        return flat[:, :2]
+    return np.asarray(UMAP(n_components=2, n_neighbors=min(10, flat.shape[0] - 1)).fit_transform(flat), dtype=np.float32)
+
+
+def plot_embedding_space(a: np.ndarray, b: np.ndarray | None = None):
+    pa = _reduce(a)
     plt.figure(figsize=(12, 8))
-    if modern_embs is None:
-        if color_by == "groups" and groups is not None and len(groups) == len(reduced):
-            unique_groups = sorted({g for g in groups if g is not None})
-            palette = plt.cm.tab10(np.linspace(0, 1, max(1, len(unique_groups))))
-            for idx, group in enumerate(unique_groups):
-                mask = np.array([g == group for g in groups])
-                plt.scatter(reduced[mask, 0], reduced[mask, 1], alpha=0.7, label=str(group), color=palette[idx])
-            plt.title("Embedding Space (Grouped)")
-            plt.legend()
-        else:
-            plt.scatter(reduced[:, 0], reduced[:, 1], c="blue", alpha=0.7)
-            plt.title("Embedding Space")
-        return plt.gcf()
+    if b is None:
+        plt.scatter(pa[:, 0], pa[:, 1], alpha=0.7)
+    else:
+        pb = _reduce(b)
+        plt.scatter(pa[:, 0], pa[:, 1], alpha=0.6, label="a")
+        plt.scatter(pb[:, 0], pb[:, 1], alpha=0.6, label="b")
+        plt.legend()
+    return plt.gcf()
 
-    n_hist = len(historical_embs)
-    hist_reduced = reduced[:n_hist]
-    modern_reduced = reduced[n_hist:]
-    plt.scatter(hist_reduced[:, 0], hist_reduced[:, 1], c="red", alpha=0.6, label="Historical")
-    plt.scatter(modern_reduced[:, 0], modern_reduced[:, 1], c="blue", alpha=0.6, label="Modern AI")
-    plt.title("Latent Space: Historical vs Modern")
-    plt.legend()
+
+def plot_points(points: np.ndarray, values: np.ndarray | None = None, title: str = "Points"):
+    reduced = _reduce(points)
+    plt.figure(figsize=(10, 8))
+    if values is None:
+        plt.scatter(reduced[:, 0], reduced[:, 1], alpha=0.7)
+    else:
+        plt.scatter(reduced[:, 0], reduced[:, 1], c=np.asarray(values), alpha=0.7)
+    plt.title(title)
     return plt.gcf()

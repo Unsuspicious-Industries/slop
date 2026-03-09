@@ -5,10 +5,9 @@ umap-learn
 matplotlib
 seaborn
 plotly
-streamlit
 torch
 torchvision
-transformers>=4.43.0
+transformers>=4.43.0,<4.47.0
 diffusers==0.31.0
 accelerate
 opencv-python

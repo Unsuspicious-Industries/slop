@@ -1,696 +1,473 @@
-"""High-level API for interacting with the SLOP server and running experiments."""
-from typing import Dict, Any, Optional, List, Union, Iterator
-import numpy as np
+from __future__ import annotations
+
+import base64
+import io
 from dataclasses import dataclass, field
-from datetime import datetime
+from typing import Any, Optional
 
-from client.config import ServerConfig
-from client.transport import SSHTransport, TransportError
+import numpy as np
+from PIL import Image
+
+from client.config import ProviderConfig
+from client.transport import SSHTransport
 from shared.protocol.messages import (
-    Request, InferenceRequest, JobResult, ServerInfo, MessageKind,
-    ErrorResponse
+    AttachJobRequest,
+    CleanupRequest,
+    DatasetStatsRequest,
+    DecodeRequest,
+    EmbedRequest,
+    EncodeRequest,
+    ErrorResponse,
+    InferenceRequest,
+    JobResult,
+    KillJobRequest,
+    ListJobsRequest,
+    MessageKind,
+    Request,
+    ServerInfo,
+    TrainRequest,
 )
-from shared.protocol.serialization import unpack_array
-import shared.metrics.bias as bias_metrics
-
-# Optional visualization imports
-try:
-    from client.visualization.trajectories import plot_trajectories
-    VISUALIZATION_AVAILABLE = True
-except ImportError:
-    VISUALIZATION_AVAILABLE = False
+from shared.protocol.serialization import pack_array, unpack_array
 
 
 @dataclass
-class TrajectoryStep:
-    """Represents a single denoising step in the diffusion process.
-    
-    This provides access to the internal state of the model at each timestep.
-    All arrays are NumPy arrays with the following shapes:
-    
-    Attributes:
-        step_index: Which step this is (0 to num_steps)
-        timestep: The scheduler timestep value (float, usually 0-1000 for SD, 0-1 for Flux)
-        latent: The latent representation at this step. Shape: (batch, channels, height, width)
-        noise_pred: The model's predicted noise. Shape: (batch, channels, height, width)
-        prompt_embedding: Text conditioning embeddings. Shape: (batch, seq_len, hidden_dim)
-    """
-    step_index: int
-    timestep: float
-    latent: np.ndarray
-    noise_pred: np.ndarray
-    prompt_embedding: np.ndarray
-    
-    @property
-    def latent_flat(self) -> np.ndarray:
-        """Flattened latent vector for analysis. Shape: (flattened_dim,)"""
-        return self.latent.flatten()
-    
-    @property
-    def noise_pred_flat(self) -> np.ndarray:
-        """Flattened noise prediction. Shape: (flattened_dim,)"""
-        return self.noise_pred.flatten()
-
-
-@dataclass  
-class InferenceResult:
-    """Complete result from a generation job.
-    
-    This contains:
-    - The final generated image
-    - The full trajectory (every step from noise to image)
-    - Metadata about the generation
-    
-    Example:
-        >>> with SlopClient(config) as client:
-        ...     result = client.generate("a cat", num_steps=20)
-        ...     
-        ...     # Access final image
-        ...     print(f"Image size: {len(result.image)} bytes")
-        ...     
-        ...     # Access trajectory
-        ...     print(f"Captured {len(result.trajectory)} steps")
-        ...     
-        ...     # Access specific step
-        ...     step_10 = result.trajectory[10]
-        ...     print(f"Step 10 timestep: {step_10.timestep}")
-        ...     print(f"Step 10 latent shape: {step_10.latent.shape}")
-    """
-    
-    # Final output
+class Result:
     image: Optional[bytes] = None
-    """PNG image bytes (None if generation failed)"""
-    
-    # Trajectory data - ALL steps are captured
-    latents: Optional[np.ndarray] = None
-    """ALL latents from every denoising step. 
-    Shape: (num_steps+1, batch, channels, height, width)
-    Index 0 = pure noise, Index -1 = final image latent"""
-    
-    noise_preds: Optional[np.ndarray] = None
-    """Model's noise predictions at each step.
-    Shape: (num_steps, batch, channels, height, width)"""
-    
-    prompt_embeds: Optional[np.ndarray] = None
-    """Text encoder embeddings (constant across steps).
-    Shape: (batch, seq_len, hidden_dim)"""
-    
+    images: list[bytes] = field(default_factory=list)
+    points: Optional[np.ndarray] = None
+    forces: Optional[np.ndarray] = None
     timesteps: Optional[np.ndarray] = None
-    """Scheduler timesteps for each step.
-    Shape: (num_steps,) - integer values like 999, 949, ..., 0"""
-    
-    # Metadata
-    metadata: Dict[str, Any] = field(default_factory=dict)
-    """Generation metadata: elapsed_s, model_id, width, height, etc."""
-    
-    @classmethod
-    def from_job_result(cls, job: JobResult) -> 'InferenceResult':
-        """Unpack a JobResult into a friendly InferenceResult."""
-        res = cls()
-        
-        # 1. Image (PNG bytes)
-        if "image" in job.payload:
-            import base64
-            img_data = job.payload["image"]
-            if isinstance(img_data, str):
-                res.image = base64.b64decode(img_data)
-            else:
-                res.image = img_data
+    embeddings: Optional[np.ndarray] = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+    arrays: dict[str, np.ndarray] = field(default_factory=dict)
 
-        # 2. Unpack arrays from wire format
-        arrays = job.arrays
-        
-        if "latents" in arrays:
-            res.latents = unpack_array(arrays["latents"])
-            
-        if "noise_preds" in arrays:
-            res.noise_preds = unpack_array(arrays["noise_preds"])
-            
-        if "prompt_embeds" in arrays:
-            res.prompt_embeds = unpack_array(arrays["prompt_embeds"])
-            
-        if "timesteps" in arrays:
-            res.timesteps = unpack_array(arrays["timesteps"])
-        
-        # 3. Metadata
-        res.metadata = {
-            **job.payload.get("metadata", {}),
+    @classmethod
+    def from_job(cls, job: JobResult) -> "Result":
+        result = cls()
+
+        encoded_images = job.payload.get("images", [])
+        if encoded_images:
+            result.images = [base64.b64decode(image) for image in encoded_images]
+            result.image = result.images[0]
+        elif isinstance(job.payload.get("image"), str) and job.payload["image"]:
+            result.image = base64.b64decode(job.payload["image"])
+            result.images = [result.image]
+
+        for name, packed in job.arrays.items():
+            result.arrays[name] = unpack_array(packed)
+
+        result.points = result.arrays.get("latents")
+        result.forces = result.arrays.get("noise_preds")
+        result.timesteps = result.arrays.get("timesteps")
+        result.embeddings = result.arrays.get("prompt_embeds")
+        result.metadata = {
             "job_id": job.job_id,
             "model_id": job.model_id,
             "prompt": job.prompt,
             "elapsed_s": job.elapsed_s,
             "request_kind": job.request_kind,
+            **job.payload,
         }
-        
-        return res
-    
-    @property
-    def num_steps(self) -> int:
-        """Number of denoising steps performed (excluding initial noise)."""
-        if self.latents is not None:
-            # latents has num_steps+1 (initial noise + each denoising step)
-            return self.latents.shape[0] - 1
-        return 0
-    
-    @property
-    def latent_shape(self) -> Optional[tuple]:
-        """Shape of individual latent tensors: (batch, channels, height, width)"""
-        if self.latents is not None and self.latents.ndim >= 4:
-            return self.latents.shape[1:]
-        return None
-    
-    @property
-    def trajectory(self) -> List[TrajectoryStep]:
-        """Get the full trajectory as a list of TrajectoryStep objects.
-        
-        This provides easy access to step-by-step data with named attributes.
-        
-        Returns:
-            List of TrajectoryStep, one per captured step
-        """
-        steps = []
-        if self.latents is None:
-            return steps
-            
-        num_steps = self.latents.shape[0]
-        
-        for i in range(num_steps):
-            step = TrajectoryStep(
-                step_index=i,
-                timestep=float(self.timesteps[i]) if self.timesteps is not None and i < len(self.timesteps) else 0.0,
-                latent=self.latents[i],
-                noise_pred=self.noise_preds[i] if self.noise_preds is not None and i < len(self.noise_preds) else np.array([]),
-                prompt_embedding=self.prompt_embeds[0] if self.prompt_embeds is not None else np.array([])
-            )
-            steps.append(step)
-            
-        return steps
-    
-    def get_step(self, index: int) -> Optional[TrajectoryStep]:
-        """Get a specific step by index.
-        
-        Args:
-            index: Step index (0 = initial noise, -1 = final latent)
-            
-        Returns:
-            TrajectoryStep or None if data unavailable
-        """
-        steps = self.trajectory
-        if not steps or index >= len(steps) or index < -len(steps):
-            return None
-        return steps[index]
-    
-    def __len__(self) -> int:
-        """Number of steps in trajectory."""
-        return self.num_steps
-    
-    def __iter__(self) -> Iterator[TrajectoryStep]:
-        """Iterate over trajectory steps."""
-        return iter(self.trajectory)
-    
-    def __repr__(self) -> str:
-        return (f"InferenceResult(num_steps={self.num_steps}, "
-                f"latent_shape={self.latent_shape}, "
-                f"image={'present' if self.image else 'missing'})")
+        return result
+
+
+def _packed(value: np.ndarray, *, half: bool, compress: bool = True) -> dict[str, Any]:
+    """Pack a numeric array for the wire protocol."""
+    arr = np.asarray(value, dtype=np.float32)
+    return pack_array(arr, compress=compress, half=half)
+
+
+def _probe_request(
+    *,
+    model_id: str,
+    points: np.ndarray,
+    timestep: int,
+    guidance_scale: float,
+    prompt: str = "",
+    negative_prompt: str = "",
+    prompt_embeds: Optional[np.ndarray] = None,
+    negative_prompt_embeds: Optional[np.ndarray] = None,
+    base_prompt: str = "",
+    base_prompt_embeds: Optional[np.ndarray] = None,
+    delta_probe: bool = False,
+) -> InferenceRequest:
+    """Build a probe request for one batched UNet evaluation."""
+    req = InferenceRequest(
+        model_id=model_id,
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        guidance_scale=guidance_scale,
+        latent_override=_packed(points, half=True),
+        score_only=True,
+        delta_probe=delta_probe,
+        probe_timestep=timestep,
+        num_steps=1,
+        seed=-1,
+        base_prompt=base_prompt,
+    )
+    if prompt_embeds is not None:
+        req.prompt_embeds_override = _packed(prompt_embeds, half=False)
+    if negative_prompt_embeds is not None:
+        req.negative_prompt_embeds_override = _packed(negative_prompt_embeds, half=False)
+    if base_prompt_embeds is not None:
+        req.base_prompt_embeds_override = _packed(base_prompt_embeds, half=False)
+    return req
 
 
 class SlopClient:
-    """Main entry point for running remote diffusion inference.
-    
-    Example:
-        >>> from client.config import registry
-        >>> from client.interface import SlopClient
-        >>> 
-        >>> config = registry.get("vast-auto-test")
-        >>> with SlopClient(config) as client:
-        ...     result = client.generate(
-        ...         prompt="a serene lake at sunset",
-        ...         num_steps=50,
-        ...         capture_latents=True  # Capture EVERY step
-        ...     )
-        ...     
-        ...     # Full trajectory access
-        ...     print(f"Generated in {len(result)} steps")
-        ...     
-        ...     # Access specific step
-        ...     mid_step = result.get_step(25)
-        ...     print(f"Step 25 timestep value: {mid_step.timestep}")
-        ...     
-        ...     # Iterate all steps
-        ...     for step in result:
-        ...         print(f"Step {step.step_index}: latent mean = {step.latent.mean():.4f}")
-    """
-    
-    def __init__(self, config: ServerConfig):
+    def __init__(self, config: ProviderConfig):
         self.config = config
         self.transport = SSHTransport(config)
         self._connected = False
 
-    def connect(self):
-        """Connect to the remote server."""
+    def connect(self) -> None:
         if not self._connected:
             self.transport.connect()
             self._connected = True
 
-    def get_server_info(self) -> ServerInfo:
-        """Query the server for capabilities and hardware info."""
-        self.connect()
-        req = Request(kind=MessageKind.SERVER_INFO.value)
-        resp = self.transport.send_request(req)
-        
-        if isinstance(resp, ErrorResponse):
-            raise RuntimeError(f"Server error: {resp.error}")
-        if not isinstance(resp, ServerInfo):
-            raise RuntimeError(f"Unexpected response type: {type(resp)}")
-            
-        return resp
-
-    def generate(
-        self,
-        prompt: str,
-        num_steps: int = 50,
-        guidance_scale: float = 7.5,
-        seed: int = -1,
-        model_id: str = "runwayml/stable-diffusion-v1-5",
-        capture_latents: bool = True,
-        capture_noise: bool = True,
-        capture_timesteps: bool = True,
-        capture_prompt_embeds: bool = False
-    ) -> InferenceResult:
-        """Run a generation job on the remote server.
-        
-        This method triggers inference and can capture the FULL trajectory
-        of the diffusion process - every step from initial noise to final image.
-        
-        Args:
-            prompt: Text description of what to generate
-            num_steps: Number of denoising steps (default: 50)
-            guidance_scale: CFG scale for prompt adherence (default: 7.5)
-            seed: Random seed for reproducibility (-1 = random)
-            model_id: HuggingFace model ID to use
-            capture_latents: If True, captures latent at EVERY step (default: True)
-            capture_noise: If True, captures noise predictions at every step (default: True)
-            capture_timesteps: If True, captures scheduler timestep values (default: True)
-            capture_prompt_embeds: If True, captures text embeddings (default: False)
-            
-        Returns:
-            InferenceResult containing:
-            - image: Final generated PNG image
-            - latents: Array of shape (num_steps+1, batch, c, h, w) with ALL step latents
-            - noise_preds: Array of shape (num_steps, batch, c, h, w) with model predictions
-            - trajectory: List of TrajectoryStep objects for easy step-by-step access
-            - metadata: Generation info (timing, model, etc.)
-            
-        Example:
-            >>> result = client.generate("a cat", num_steps=20)
-            >>> 
-            >>> # Check we got all steps
-            >>> assert len(result) == 20
-            >>> 
-            >>> # Access final image
-            >>> with open("output.png", "wb") as f:
-            ...     f.write(result.image)
-            >>> 
-            >>> # Analyze trajectory
-            >>> step_0 = result.get_step(0)  # Initial noise
-            >>> step_10 = result.get_step(10)  # Mid-generation
-            >>> step_20 = result.get_step(-1)  # Final latent
-            >>> 
-            >>> print(f"Step 0 latent mean: {step_0.latent.mean():.4f}")
-            >>> print(f"Step 20 latent mean: {step_20.latent.mean():.4f}")
-        """
-        self.connect()
-        
-        req = InferenceRequest(
-            prompt=prompt,
-            num_steps=num_steps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            model_id=model_id,
-            capture_latents=capture_latents,
-            capture_noise_pred=capture_noise,
-            capture_timesteps=capture_timesteps,
-            capture_prompt_embeds=capture_prompt_embeds
-        )
-        
-        resp = self.transport.send_request(req)
-        
-        if isinstance(resp, ErrorResponse):
-            raise RuntimeError(f"Inference failed: {resp.error}\n{resp.traceback}")
-            
-        if not isinstance(resp, JobResult):
-            raise RuntimeError(f"Unexpected response: {resp}")
-            
-        return InferenceResult.from_job_result(resp)
-
-    def close(self):
-        """Shutdown the connection."""
+    def close(self) -> None:
         self.transport.close()
         self._connected = False
 
-    def __enter__(self):
+    def __enter__(self) -> "SlopClient":
         self.connect()
         return self
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
+    def __exit__(self, _exc_type, _exc_val, _exc_tb) -> None:
         self.close()
 
-    # --------------------------------------------------------------------------
-    # Prompt Embedding Extraction
-    # --------------------------------------------------------------------------
-
-    def get_prompt_embeds(
-        self,
-        prompts: 'Union[str, List[str]]',
-        model_id: str = "runwayml/stable-diffusion-v1-5",
-    ) -> np.ndarray:
-        """Encode text prompts through the diffusion model's text encoder.
-
-        Returns the prompt embeddings that would normally be fed to the UNet.
-        These can be manipulated (e.g. adding identity vectors) and passed
-        back via generate_with_embeds() to bypass the text encoder entirely.
-
-        Args:
-            prompts: Single string or list of strings to encode
-            model_id: Which model's text encoder to use
-
-        Returns:
-            If single string: (1, seq_len, hidden_dim) numpy array
-            If list: (n_prompts, seq_len, hidden_dim) numpy array
-        """
-        from shared.protocol.messages import EncodeRequest, MessageKind, ErrorResponse, JobResult
-        from shared.protocol.serialization import unpack_array
-
+    def _job(self, req: Request) -> JobResult:
+        """Send one request and require a successful job result."""
         self.connect()
+        resp = self.transport.send_request(req)
+        if isinstance(resp, ErrorResponse):
+            raise RuntimeError(resp.error if not resp.traceback else f"{resp.error}\n{resp.traceback}")
+        if not isinstance(resp, JobResult):
+            raise RuntimeError(f"unexpected response: {type(resp)}")
+        return resp
 
-        single = isinstance(prompts, str)
-        texts = [prompts] if single else prompts
+    def info(self) -> ServerInfo:
+        """Return server metadata."""
+        self.connect()
+        resp = self.transport.send_request(Request(kind=MessageKind.SERVER_INFO.value))
+        if isinstance(resp, ErrorResponse):
+            raise RuntimeError(resp.error)
+        if not isinstance(resp, ServerInfo):
+            raise RuntimeError(f"unexpected response: {type(resp)}")
+        return resp
 
-        req = EncodeRequest(
+    def cleanup(self, clear_model: bool = False, timeout_s: float = 60.0) -> dict:
+        """Trigger memory cleanup on the server."""
+        self.connect()
+        req = CleanupRequest(kind=MessageKind.CLEANUP.value, clear_model=clear_model)
+        resp = self.transport.send_request(req, timeout_s=timeout_s)
+        if isinstance(resp, ErrorResponse):
+            raise RuntimeError(resp.error)
+        return resp.payload if hasattr(resp, "payload") and resp.payload else {}
+
+    def train(
+        self,
+        manifest_path: str,
+        output_dir: str,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+        batch_size: int = 2,
+        epochs: int = 1,
+        learning_rate: float = 5e-5,
+        lora_rank: int = 16,
+        save_every: int = 50,
+        timeout_s: float = 60.0,
+    ) -> Result:
+        """Start an autonomous training job on the remote server.
+        
+        Args:
+            manifest_path: Path to manifest.jsonl on the REMOTE server
+            output_dir: Where to save checkpoints on the REMOTE server
+            model_id: Base model to train
+            batch_size: Training batch size
+            epochs: Number of training epochs
+            learning_rate: Learning rate
+            lora_rank: LoRA rank (for LoRA training)
+            save_every: Save checkpoint every N steps
+            timeout_s: Timeout for training job
+            
+        Returns:
+            Result with training stats in metadata
+        """
+        self.connect()
+        req = TrainRequest(
             model_id=model_id,
-            modality="text",
-            inputs=texts,
+            manifest_path=manifest_path,
+            output_dir=output_dir,
+            batch_size=batch_size,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            lora_rank=lora_rank,
+            save_every=save_every,
+        )
+        # This should return quickly (it starts a detached worker)
+        resp = self.transport.send_request(req, timeout_s=timeout_s)
+        if isinstance(resp, ErrorResponse):
+            raise RuntimeError(resp.error)
+        if not isinstance(resp, JobResult):
+            raise RuntimeError(f"unexpected response: {type(resp)}")
+        
+        # Return a Result-like object with the job start metadata
+        result = Result()
+        result.metadata = {
+            "job_id": resp.job_id,
+            "elapsed_s": resp.elapsed_s,
+            **resp.payload,
+        }
+        return result
+
+    def list_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List autonomous jobs on the remote server."""
+        job = self._job(ListJobsRequest(limit=limit))
+        return list(job.payload.get("jobs", []))
+
+    def attach_job(self, job_id: str, since_line: int = 0, max_lines: int = 200) -> dict[str, Any]:
+        """Fetch job status and progress events since a line offset."""
+        job = self._job(AttachJobRequest(target_job_id=job_id, since_line=since_line, max_lines=max_lines))
+        return dict(job.payload)
+
+    def kill_job(self, job_id: str, signal: str = "term") -> dict[str, Any]:
+        """Terminate a running job."""
+        job = self._job(KillJobRequest(target_job_id=job_id, signal=signal))
+        return dict(job.payload)
+
+    def dataset_stats(self, manifest_path: str, sample_images: int = 16, max_records: int = 100000) -> dict[str, Any]:
+        """Get a dataset summary for a manifest on the remote server."""
+        job = self._job(DatasetStatsRequest(manifest_path=manifest_path, sample_images=sample_images, max_records=max_records))
+        return dict(job.payload)
+
+    def encode(self, texts: str | list[str], model_id: str = "runwayml/stable-diffusion-v1-5") -> np.ndarray:
+        """Encode text strings into prompt embeddings."""
+        inputs = [texts] if isinstance(texts, str) else list(texts)
+        job = self._job(EncodeRequest(model_id=model_id, modality="text", inputs=inputs))
+        return unpack_array(job.arrays["prompt_embeds"])
+
+    def embed(
+        self,
+        prompt: str = "",
+        negative_prompt: str = "",
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Encode a prompt pair into (prompt_embeds, negative_prompt_embeds).
+
+        Returns embeddings of shape (1, 77, 768) each.
+        These can be composed arithmetically before passing to sample_from_embeds().
+        """
+        job = self._job(EmbedRequest(
+            model_id=model_id,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            return_prompt_embeds=True,
+            return_negative_prompt_embeds=True,
+        ))
+        return (
+            unpack_array(job.arrays["prompt_embeds"]),
+            unpack_array(job.arrays["negative_prompt_embeds"]),
         )
 
-        resp = self.transport.send_request(req)
-
-        if isinstance(resp, ErrorResponse):
-            raise RuntimeError(f"Encode failed: {resp.error}")
-        if not isinstance(resp, JobResult):
-            raise RuntimeError(f"Unexpected response: {type(resp)}")
-
-        if "prompt_embeds" in resp.arrays:
-            embeds = unpack_array(resp.arrays["prompt_embeds"])
-            return embeds
-
-        raise RuntimeError("No prompt_embeds in response")
-
-    # --------------------------------------------------------------------------
-    # Embedding-Override Generation
-    # --------------------------------------------------------------------------
-
-    def generate_with_embeds(
+    def sample(
         self,
-        prompt_embeds: np.ndarray,
-        negative_prompt_embeds: 'Optional[np.ndarray]' = None,
+        prompt: str = "",
         num_steps: int = 50,
-        guidance_scale: float = 7.5,
         seed: int = -1,
+        batch_size: int = 1,
+        height: int = 512,
+        width: int = 512,
+        guidance_scale: float = 7.5,
+        negative_prompt: str = "",
         model_id: str = "runwayml/stable-diffusion-v1-5",
-        capture_latents: bool = True,
-        capture_noise: bool = True,
-        capture_timesteps: bool = True,
-    ) -> InferenceResult:
-        """Generate an image using pre-computed prompt embeddings.
-
-        Instead of sending a text prompt (which the server would encode),
-        this sends the embeddings directly. This is used for identity-vector
-        experiments where we want the ONLY difference between categories
-        to be a computed direction vector in embedding space.
-
-        Args:
-            prompt_embeds: (1, seq_len, hidden_dim) numpy array
-            negative_prompt_embeds: (1, seq_len, hidden_dim) for CFG.
-                                    If None, server encodes empty string.
-            num_steps: Number of denoising steps
-            guidance_scale: CFG scale
-            seed: Random seed (-1 = random)
-            model_id: HuggingFace model ID
-            capture_latents: Capture full trajectory
-            capture_noise: Capture noise predictions
-            capture_timesteps: Capture scheduler timesteps
-
-        Returns:
-            InferenceResult (same as generate())
-        """
-        from shared.protocol.serialization import pack_array
-
-        self.connect()
-
-        # Pack embeddings for wire transfer
-        pe_packed = pack_array(prompt_embeds.astype(np.float32), compress=True, half=False)
-        npe_packed = None
-        if negative_prompt_embeds is not None:
-            npe_packed = pack_array(negative_prompt_embeds.astype(np.float32), compress=True, half=False)
-
+    ) -> Result:
+        """Run sampling and return latents (no rendering). Use render() to decode latents to images."""
         req = InferenceRequest(
-            prompt="",  # empty — embeddings override
+            model_id=model_id,
+            prompt=prompt,
+            negative_prompt=negative_prompt,
             num_steps=num_steps,
             guidance_scale=guidance_scale,
             seed=seed,
-            model_id=model_id,
-            capture_latents=capture_latents,
-            capture_noise_pred=capture_noise,
-            capture_timesteps=capture_timesteps,
-            prompt_embeds_override=pe_packed,
-            negative_prompt_embeds_override=npe_packed,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            capture_latents=True,
+            capture_noise_pred=True,
+            capture_timesteps=True,
+            capture_prompt_embeds=True,
+            decode_latents=False,
         )
+        return Result.from_job(self._job(req))
 
-        resp = self.transport.send_request(req)
-
-        if isinstance(resp, ErrorResponse):
-            raise RuntimeError(f"Inference failed: {resp.error}\n{resp.traceback}")
-        if not isinstance(resp, JobResult):
-            raise RuntimeError(f"Unexpected response: {resp}")
-
-        return InferenceResult.from_job_result(resp)
-
-    def generate_batch_with_embeds(
+    def sample_from_embeds(
         self,
         prompt_embeds: np.ndarray,
-        negative_prompt_embeds: 'Optional[np.ndarray]' = None,
-        n_variations: int = 20,
+        negative_prompt_embeds: np.ndarray,
+        initial_latents: Optional[np.ndarray] = None,
+        # backward-compatible alias (some notebooks call `initial_latent`)
+        initial_latent: Optional[np.ndarray] = None,
         num_steps: int = 50,
+        seed: int = -1,
+        batch_size: int = 1,
+        height: int = 512,
+        width: int = 512,
         guidance_scale: float = 7.5,
         model_id: str = "runwayml/stable-diffusion-v1-5",
-        seed_start: int = 0,
-        capture_latents: bool = True,
-        capture_noise: bool = True,
-        progress: bool = True,
-    ) -> List[InferenceResult]:
-        """Generate multiple variations from the same embeddings with different seeds.
+    ) -> Result:
+        """Run sampling from pre-computed embeddings. Returns latents — use render() to decode.
 
-        Identical to generate_batch() but uses pre-computed embeddings instead
-        of a text prompt. Each variation uses seed_start + i.
-
-        Args:
-            prompt_embeds: (1, seq_len, hidden_dim) — the conditioned embedding
-            negative_prompt_embeds: (1, seq_len, hidden_dim) — for CFG
-            n_variations: Number of variations
-            num_steps: Denoising steps per generation
-            guidance_scale: CFG scale
-            model_id: HuggingFace model ID
-            seed_start: Starting seed
-            capture_latents: Capture full trajectory
-            capture_noise: Capture noise predictions
-            progress: Print progress
-
-        Returns:
-            List of InferenceResult, one per variation
+        Embeddings can be composed arithmetically before calling:
+            embeds_a, neg_a = client.embed("a person running")
+            embeds_b, neg_b = client.embed("an arab person running")
+            identity_vec = embeds_b - embeds_a
+            result = client.sample_from_embeds(embeds_a + identity_vec, neg_a)
+        
+        You can also pass `initial_latents` to start diffusion from a specific latent
+        tensor (shape: (B, C, H, W)). When provided the sampler will initialize
+        its latents to this value instead of sampling random noise.
         """
-        results = []
-        for i in range(n_variations):
-            if progress:
-                print(f"  [{i+1}/{n_variations}] seed={seed_start + i}", end="... ", flush=True)
+        req = InferenceRequest(
+            model_id=model_id,
+            num_steps=num_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            capture_latents=True,
+            capture_noise_pred=True,
+            capture_timesteps=True,
+            capture_prompt_embeds=True,
+            decode_latents=False,
+            prompt_embeds_override=_packed(prompt_embeds, half=False),
+            negative_prompt_embeds_override=_packed(negative_prompt_embeds, half=False),
+        )
+        # Accept either `initial_latents` (plural) or the historical alias
+        # `initial_latent` (singular). Prefer the explicit plural if both are set.
+        init = initial_latents if initial_latents is not None else initial_latent
+        if init is not None:
+            req.latent_override = _packed(init, half=True)
+        return Result.from_job(self._job(req))
 
-            result = self.generate_with_embeds(
+    def sample_delta(
+        self,
+        target_embeds: np.ndarray,
+        base_embeds: np.ndarray,
+        negative_prompt_embeds: np.ndarray,
+        num_steps: int = 50,
+        seed: int = -1,
+        batch_size: int = 1,
+        height: int = 512,
+        width: int = 512,
+        guidance_scale: float = 7.5,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+    ) -> Result:
+        """Run sampling in a differential field: force = score(target) - score(base).
+
+        This allows following the semantic direction isolated by the difference of two prompts.
+        """
+        req = InferenceRequest(
+            model_id=model_id,
+            num_steps=num_steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            batch_size=batch_size,
+            height=height,
+            width=width,
+            capture_latents=True,
+            capture_noise_pred=True,
+            capture_timesteps=True,
+            decode_latents=False,
+            delta_sample=True,
+            prompt_embeds_override=_packed(target_embeds, half=False),
+            base_prompt_embeds_override=_packed(base_embeds, half=False),
+            negative_prompt_embeds_override=_packed(negative_prompt_embeds, half=False),
+        )
+        return Result.from_job(self._job(req))
+
+    def probe_at(
+        self,
+        points: np.ndarray,
+        prompt_embeds: np.ndarray,
+        negative_prompt_embeds: np.ndarray,
+        timestep: int = 500,
+        guidance_scale: float = 7.5,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+    ) -> np.ndarray:
+        """Evaluate score model at batched latent points using pre-computed embeddings.
+
+        points: (B, C, H, W) — batch of latent vectors
+        Returns forces: (B, C, H, W)
+        """
+        job = self._job(_probe_request(
+            model_id=model_id,
+            points=points,
+            timestep=timestep,
+            guidance_scale=guidance_scale,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+        ))
+        return unpack_array(job.arrays["noise_preds"])
+
+    def render(self, latents: np.ndarray, model_id: str = "runwayml/stable-diffusion-v1-5") -> list[Image.Image]:
+        """Decode a batch of latents into images."""
+        job = self._job(DecodeRequest(model_id=model_id, latents=_packed(latents, half=True)))
+        images = [Image.open(io.BytesIO(base64.b64decode(image))).convert("RGB") for image in job.payload.get("images", [])]
+        return images
+
+    def probe(
+        self,
+        points: np.ndarray,
+        *,
+        prompt: str = "",
+        negative_prompt: str = "",
+        prompt_embeds: Optional[np.ndarray] = None,
+        negative_prompt_embeds: Optional[np.ndarray] = None,
+        timestep: int = 500,
+        guidance_scale: float = 7.5,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+    ) -> np.ndarray:
+        """Evaluate the score model on a batch of points at one timestep."""
+        job = self._job(
+            _probe_request(
+                model_id=model_id,
+                points=points,
+                timestep=timestep,
+                guidance_scale=guidance_scale,
+                prompt=prompt,
+                negative_prompt=negative_prompt,
                 prompt_embeds=prompt_embeds,
                 negative_prompt_embeds=negative_prompt_embeds,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-                seed=seed_start + i,
-                model_id=model_id,
-                capture_latents=capture_latents,
-                capture_noise=capture_noise,
             )
-            results.append(result)
+        )
+        return unpack_array(job.arrays["noise_preds"])
 
-            if progress:
-                elapsed = result.metadata.get('elapsed_s', 0)
-                print(f"{elapsed:.1f}s")
-
-        return results
-
-    # --------------------------------------------------------------------------
-    # Batch Generation (text prompt)
-    # --------------------------------------------------------------------------
-
-    def generate_batch(
+    def probe_delta(
         self,
-        prompt: str,
-        n_variations: int = 20,
-        num_steps: int = 50,
+        points: np.ndarray,
+        *,
+        prompt_a: str,
+        prompt_b: str,
+        negative_prompt: str = "",
+        timestep: int = 500,
         guidance_scale: float = 7.5,
         model_id: str = "runwayml/stable-diffusion-v1-5",
-        seed_start: int = 0,
-        capture_latents: bool = True,
-        capture_noise: bool = True,
-        progress: bool = True,
-    ) -> List[InferenceResult]:
-        """Generate multiple variations of the same prompt with different seeds.
-        
-        Used for averaging out noise to find systematic patterns.
-        Each variation uses seed_start + i as seed.
-        
-        Args:
-            prompt: Text prompt
-            n_variations: Number of variations to generate
-            num_steps: Denoising steps per generation
-            guidance_scale: CFG scale
-            model_id: HuggingFace model ID
-            seed_start: Starting seed (seeds will be seed_start, seed_start+1, ...)
-            capture_latents: Capture full trajectory
-            capture_noise: Capture noise predictions
-            progress: Print progress
-            
-        Returns:
-            List of InferenceResult, one per variation
-        """
-        results = []
-        for i in range(n_variations):
-            if progress:
-                print(f"  [{i+1}/{n_variations}] seed={seed_start + i}", end="... ", flush=True)
-            
-            result = self.generate(
-                prompt=prompt,
-                num_steps=num_steps,
-                guidance_scale=guidance_scale,
-                seed=seed_start + i,
-                model_id=model_id,
-                capture_latents=capture_latents,
-                capture_noise=capture_noise,
-            )
-            results.append(result)
-            
-            if progress:
-                elapsed = result.metadata.get('elapsed_s', 0)
-                print(f"{elapsed:.1f}s")
-        
-        return results
-
-    def encode_images(
-        self,
-        images: List[bytes],
-        model_id: str = "openai/clip-vit-large-patch14",
     ) -> np.ndarray:
-        """Encode images through a remote encoder (CLIP, DINOv2, etc).
-        
-        Args:
-            images: List of PNG/JPEG image bytes
-            model_id: Encoder model ID
-            
-        Returns:
-            Embeddings array of shape (n_images, embed_dim)
-        """
-        import base64
-        from shared.protocol.messages import EncodeRequest, MessageKind, ErrorResponse, JobResult
-        from shared.protocol.serialization import unpack_array
-        
-        self.connect()
-        
-        encoded = [base64.b64encode(img).decode('ascii') for img in images]
-        
-        req = EncodeRequest(
-            model_id=model_id,
-            modality="image",
-            inputs=encoded,
+        """Return one batched delta probe from two prompts."""
+        job = self._job(
+            _probe_request(
+                model_id=model_id,
+                points=points,
+                timestep=timestep,
+                guidance_scale=guidance_scale,
+                prompt=prompt_b,
+                negative_prompt=negative_prompt,
+                base_prompt=prompt_a,
+                delta_probe=True,
+            )
         )
-        
-        resp = self.transport.send_request(req)
-        
-        if isinstance(resp, ErrorResponse):
-            raise RuntimeError(f"Encode failed: {resp.error}")
-        if not isinstance(resp, JobResult):
-            raise RuntimeError(f"Unexpected response: {type(resp)}")
-        
-        if "embeddings" in resp.arrays:
-            return unpack_array(resp.arrays["embeddings"])
-        
-        raise RuntimeError("No embeddings in response")
+        return unpack_array(job.arrays["delta_noise_preds"])
 
-    # --------------------------------------------------------------------------
-    # Analysis Helpers
-    # --------------------------------------------------------------------------
 
-    def analyze_drift(self, result: InferenceResult, stereotype_poles: np.ndarray) -> float:
-        """Calculate drift strength for the generated trajectory against stereotype poles.
-        
-        Args:
-            result: The result from `generate()`
-            stereotype_poles: Array of shape (n_poles, n_features) defining the bias directions
-            
-        Returns:
-            Drift strength score (positive = drift away, negative = drift towards)
-        """
-        if result.latents is None:
-            raise ValueError("Result does not contain latents. Did you run with capture_latents=True?")
-            
-        # Reshape latents if necessary: (steps, batch, c, h, w) -> (steps, flattened)
-        # Or usually we analyze the embedding space. If latents are spatial, we might need to average.
-        # For this example, let's assume we flatten per step.
-        traj = result.latents
-        if traj.ndim > 2:
-            # Average spatial dims and channel dims to get a single vector per step?
-            # Or just flatten. Let's flatten for now as a naive baseline.
-            traj = traj.reshape(traj.shape[0], -1)
-            
-        return bias_metrics.drift_strength(traj, stereotype_poles)
-
-    def analyze_deviation(self, result: InferenceResult, baseline_latents: np.ndarray) -> float:
-        """Calculate deviation from a baseline trajectory."""
-        if result.latents is None:
-            raise ValueError("Result does not contain latents.")
-            
-        traj = result.latents.reshape(result.latents.shape[0], -1)
-        base = baseline_latents.reshape(baseline_latents.shape[0], -1)
-        
-        return bias_metrics.trajectory_deviation(traj, base)
-
-    def visualize_trajectory(self, result: InferenceResult, poles: Optional[np.ndarray] = None):
-        """Visualize the denoising trajectory using UMAP.
-        
-        Args:
-            result: The inference result containing latents.
-            poles: Optional stereotype poles to plot alongside the trajectory.
-            
-        Returns:
-            matplotlib.figure.Figure: The plot figure.
-        """
-        if not VISUALIZATION_AVAILABLE:
-            raise ImportError("Visualization dependencies (umap-learn, matplotlib) not installed.")
-            
-        if result.latents is None:
-            raise ValueError("Result does not contain latents.")
-            
-        # Flatten latents: (steps, batch, c, h, w) -> (steps, flattened)
-        # We assume batch size 1 for now, or just take the first batch item
-        latents = result.latents
-        if latents.ndim > 2:
-            # Take first batch item if present
-            if latents.shape[1] == 1: # (steps, 1, ...)
-                latents = latents[:, 0]
-            
-            # Flatten remaining dims
-            latents = latents.reshape(latents.shape[0], -1)
-            
-        return plot_trajectories([latents], poles if poles is not None else np.array([]))
+__all__ = ["Result", "SlopClient"]

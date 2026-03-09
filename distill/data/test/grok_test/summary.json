@@ -1,0 +1,15 @@
+{
+  "dataset_name": "test",
+  "run_id": "grok_test",
+  "teacher": "grok",
+  "model_id": "runwayml/stable-diffusion-v1-5",
+  "partial_supervision": true,
+  "num_records": 1,
+  "num_unique_prompts": 1,
+  "num_unique_final_images": 1,
+  "samples_per_prompt": 1,
+  "auto_variations": true,
+  "variation_preset": "bias_lite",
+  "started_at": 1773075626.6489692,
+  "finished_at": 1773075637.5532897
+}

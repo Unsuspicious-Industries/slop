@@ -1,15 +1,41 @@
-"""Deployment tool to push code to remote servers and register them."""
+"""Deployment tool to push code to remote providers and register them."""
 import argparse
 import subprocess
 import sys
 import shlex
 from pathlib import Path
 
-# Fix path to include project root
-project_root = Path(__file__).parent.parent
+
+def _looks_like_project_root(path: Path) -> bool:
+    required = ["client", "server", "shared"]
+    return all((path / name).exists() for name in required)
+
+
+def _detect_project_root() -> Path:
+    candidates = []
+
+    cwd = Path.cwd().resolve()
+    candidates.extend([cwd, *cwd.parents])
+
+    file_root = Path(__file__).resolve().parent.parent
+    candidates.extend([file_root, *file_root.parents])
+
+    seen = set()
+    for candidate in candidates:
+        candidate_str = str(candidate)
+        if candidate_str in seen:
+            continue
+        seen.add(candidate_str)
+        if _looks_like_project_root(candidate):
+            return candidate
+
+    return file_root
+
+
+project_root = _detect_project_root()
 sys.path.append(str(project_root))
 
-from client.config import Registry, ServerConfig
+from client.config import ProviderConfig, Registry
 
 def run_command(cmd, shell=False):
     print(f"Running: {' '.join(cmd) if isinstance(cmd, list) else cmd}")
@@ -24,7 +50,7 @@ def deploy(args):
     1. Rsync code to remote.
     2. Register in config.
     """
-    target = args.target  # user@host
+    target = args.target
     remote_path = args.path
     name = args.name or target.split('@')[-1]
     
@@ -36,10 +62,14 @@ def deploy(args):
     safe_remote_path = shlex.quote(remote_path)
     run_command(["ssh", target, f"mkdir -p {safe_remote_path}"])
     
-    # Sync folders
-    # We sync: shared/, server/, containers/ (if exists), requirements.txt
-    
-    sources = ["shared", "server"]
+    # Sync folders needed for runtime and examples.
+    sources = ["shared", "server", "client"]
+    if (project_root / "experiments").exists():
+        sources.append("experiments")
+    if (project_root / "notebooks").exists():
+        sources.append("notebooks")
+    if (project_root / "distill").exists():
+        sources.append("distill")
     if (project_root / "containers").exists():
         sources.append("containers")
     if (project_root / "requirements.txt").exists():
@@ -52,6 +82,11 @@ def deploy(args):
         "--exclude", "*.pyc",
         "--exclude", ".git",
         "--exclude", ".DS_Store",
+        # Never deploy generated data/artifacts (huge, slow, and not needed)
+        "--exclude", "distill/data",
+        "--exclude", "distill/output",
+        "--exclude", "notebooks/distill/data",
+        "--exclude", ".ipynb_checkpoints",
     ]
     
     for src in sources:
@@ -78,9 +113,10 @@ def deploy(args):
     elif not python_cmd:
         python_cmd = "python3"
         
-    config = ServerConfig(
+    config = ProviderConfig(
         name=name,
-        host=target,
+        kind="local" if target == "local" else "ssh",
+        target=target,
         remote_path=remote_path,
         python_cmd=python_cmd,
         container_image=container_image,
@@ -88,7 +124,7 @@ def deploy(args):
     )
     
     reg.add(config)
-    print(f"Successfully deployed and registered server '{name}'!")
+    print(f"Successfully deployed and registered provider '{name}'!")
     if container_image:
         print(f"  Container: {container_image}")
         

@@ -1,0 +1,15 @@
+{
+  "dataset_name": "openrouter",
+  "run_id": "openrouter_v1",
+  "teacher": "openrouter",
+  "model_id": "runwayml/stable-diffusion-v1-5",
+  "partial_supervision": false,
+  "num_records": 69,
+  "num_unique_prompts": 50,
+  "num_unique_final_images": 69,
+  "samples_per_prompt": 10,
+  "auto_variations": true,
+  "variation_preset": "bias_lite",
+  "started_at": 1773076416.4338508,
+  "finished_at": 1773076481.904626
+}

@@ -1,6 +1,6 @@
 # SLOP: Vector Field Analysis for Diffusion Bias
 
-**SLOP** (Server-Local Operations for Physics) is a tool for analyzing latent biases in diffusion models using physics-based vector fields. It is designed to run in restricted HPC environments (Singularity containers, no root, no open ports) by tunneling a custom binary protocol over SSH.
+**SLOP** (Server-Local Operations for Physics) is a tool for analyzing latent biases in diffusion models by querying the model directly in latent space. It is designed to run in restricted HPC environments (Singularity containers, no root, no open ports) by tunneling a custom binary protocol over SSH.
 
 ## Architecture
 
@@ -11,8 +11,8 @@
 *   **Client (`client/`)**: Runs on your local machine.
     *   Manages SSH tunnels transparently.
     *   Provides a CLI for deployment and health checks.
-    *   Performs physics analysis (vector field interpolation, critical point detection) and visualization.
-*   **Shared (`shared/`)**:
+    *   Probes diffusion models at arbitrary latent positions, runs custom delta-driven rollouts, and saves latent-space artefacts for later analysis.
+*   **Shared (`shared/`))**:
     *   Protocol definitions and serialization.
     *   Core physics math (numpy-only).
 
@@ -22,7 +22,20 @@
 *   **Local:** Python 3.9+
 *   **Remote:** Python 3.9+, SSH access, GPU
 
-### 2. Deploy to Remote
+### 2. Quick Start with Vast.ai
+
+```bash
+# Sync running vast.ai instances to registry
+python -m client.vastai --sync
+
+# Check connection
+python -m client.manage check vast-32582479
+
+# Run a test generation
+python experiments/sample.py
+```
+
+### 3. Deploy to Remote (SSH)
 Push the code to your HPC node. This copies the necessary `server` and `shared` code.
 
 ```bash
@@ -30,7 +43,7 @@ Push the code to your HPC node. This copies the necessary `server` and `shared` 
 python -m client.deploy user@login.cluster.edu --path /scratch/user/slop --name cluster-a
 ```
 
-### 3. Check Connection
+### 4. Check Connection
 Verify the server is reachable and the GPU is detected.
 
 ```bash
@@ -43,8 +56,64 @@ To run a quick generation test (verifies CUDA and model loading):
 python -m client.manage check cluster-a --verify
 ```
 
-### 4. Run Analysis (Coming Soon)
-(This section will describe how to use `client.interface` to run full experiments).
+### 5. Image Generation Workflow
+
+The client provides two methods:
+- `client.sample()` - Generates latents (no image rendered, memory efficient)
+- `client.render(latents)` - Decodes latents to PIL Images
+
+```python
+from client.config import registry
+from client.interface import SlopClient
+
+# Get provider
+providers = registry.list()
+client = SlopClient(providers[-1])
+client.connect()
+
+# Generate latents (no image)
+result = client.sample(prompt="a cat", num_steps=20, seed=42)
+
+# Render latents to images
+images = client.render(result.points[-1])
+images[0].save("cat.png")
+
+client.close()
+```
+
+### 6. Run Delta-Field Experiments
+
+The current workflow does not reconstruct a global field from samples. Instead,
+it uses the model itself as the field oracle:
+
+- pick a base prompt embedding `x`
+- build a biased embedding `b = x + v_identity`
+- evaluate `delta(z, t) = eps_b(z, t) - eps_x(z, t)` directly from the model
+- save all sampled latent positions and all returned tensors for later analysis
+
+Useful entry points:
+
+```bash
+python experiments/delta_map.py --base-prompt "in a city"
+python experiments/delta_rollout.py --base-prompt "in a city"
+```
+
+`delta_map.py` samples many latent positions and saves:
+
+- `latents.npy`
+- `base_noise_preds.npy`
+- `biased_noise_preds.npy`
+- `delta_noise_preds.npy`
+- `force.npy`
+
+`delta_rollout.py` runs an experimental denoising loop using the delta itself and saves:
+
+- every visited latent position
+- per-step base / biased / delta noise predictions
+- the final decoded image
+
+The rollout is intentionally experimental, especially in `delta_only` mode.
+Treat it as a probe into what the delta field does, not as a standard sampling method.
 
 ## Development
 
@@ -54,7 +123,8 @@ python -m client.manage check cluster-a --verify
 ├── server/          # Remote code (inference engine, daemon)
 ├── shared/          # Common protocol and physics logic
 ├── containers/      # Singularity/Apptainer definition files
-└── data/            # Local data storage
+├── notebooks/       # Jupyter notebooks for exploration
+└── experiments/     # Experiment scripts
 ```
 
 ### Protocol

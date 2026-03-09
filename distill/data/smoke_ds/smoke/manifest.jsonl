@@ -1,0 +1,1 @@
+{"prompt": "test prompt", "prompt_key": "cb2fea287ffb357f", "teacher": "grok", "final_path": "distill/data/smoke_ds/smoke/samples/000000_test_final.png", "partial_paths": [], "final_sha256": "abc", "partial_sha256": [], "partial_count": 0, "metadata": {}, "collected_at": 0.0}

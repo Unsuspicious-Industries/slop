@@ -84,7 +84,10 @@ def _read_exact(stream: BinaryIO, n: int) -> bytes:
     """Read exactly *n* bytes, handling partial reads."""
     buf = bytearray()
     while len(buf) < n:
-        chunk = stream.read(n - len(buf))
+        # Read in chunks (e.g. 512KB) to avoid single massive read calls
+        # which can trigger OS-level timeouts or buffer weirdness on pipes
+        to_read = min(n - len(buf), 512 * 1024)
+        chunk = stream.read(to_read)
         if not chunk:
             break
         buf.extend(chunk)

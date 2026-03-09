@@ -1,8 +1,4 @@
-"""Message types for the SLOP inference protocol.
-
-Every request/response is a plain dict serializable to msgpack.
-We use dataclass-like structures for clarity but convert to dicts for wire.
-"""
+"""Minimal wire protocol for remote inference primitives."""
 
 from __future__ import annotations
 
@@ -20,8 +16,16 @@ class MessageKind(str, enum.Enum):
     PING = "ping"
     SERVER_INFO = "server_info"
     INFERENCE = "inference"          # run diffusion, get full introspection
+    EMBED = "embed"                  # encode prompts -> embeddings only
     ENCODE = "encode"                # encode text/image -> embeddings
+    DECODE = "decode"                # VAE-decode raw latents -> images
     INTROSPECT = "introspect"        # model metadata / architecture dump
+    CLEANUP = "cleanup"              # trigger VRAM / memory cleanup
+    TRAIN = "train"                  # run training on remote
+    JOB_LIST = "job_list"            # list autonomous jobs
+    JOB_ATTACH = "job_attach"        # fetch job status/progress (poll)
+    JOB_KILL = "job_kill"            # terminate a job
+    DATASET_STATS = "dataset_stats"  # summarize a manifest dataset
     SHUTDOWN = "shutdown"
 
     # Server -> Client
@@ -53,17 +57,6 @@ class Request:
 
 @dataclass
 class InferenceRequest(Request):
-    """Run diffusion generation with full trajectory capture.
-
-    The server will return:
-      - final image (PNG bytes)
-      - per-step latents (compressed numpy)
-      - per-step noise predictions
-      - prompt embeddings (text encoder hidden states)
-      - attention maps (cross-attention, if captured)
-      - scheduler state (sigmas / timesteps)
-      - model config metadata
-    """
     kind: str = MessageKind.INFERENCE.value
 
     model_id: str = "stabilityai/stable-diffusion-2-1"
@@ -74,21 +67,26 @@ class InferenceRequest(Request):
     height: int = 512
     width: int = 512
     seed: int = -1                    # -1 = random
+    batch_size: int = 1
 
-    # Introspection knobs
     capture_latents: bool = True
     capture_noise_pred: bool = True
     capture_prompt_embeds: bool = True
-    capture_attention: bool = False   # expensive, off by default
-    capture_timesteps: bool = True    # capture scheduler timestep values
-    latent_sample_rate: int = 1       # capture every N steps
-    compress_latents: bool = True     # float16 + zlib
+    capture_timesteps: bool = True
+    compress_latents: bool = True
+    decode_latents: bool = True        # if False, skip VAE decode (just return latents)
 
-    # Embedding overrides — bypass text encoder, inject embeddings directly.
-    # Values are packed-array dicts from shared.protocol.serialization.pack_array.
-    # When set, the server skips text encoding and uses these embeddings for the UNet.
     prompt_embeds_override: Optional[Dict[str, Any]] = None
     negative_prompt_embeds_override: Optional[Dict[str, Any]] = None
+    base_prompt_embeds_override: Optional[Dict[str, Any]] = None
+    base_prompt: str = ""
+
+    latent_override: Optional[Dict[str, Any]] = None
+
+    score_only: bool = False
+    delta_probe: bool = False
+    delta_sample: bool = False        # if True, run sampling in differential field
+    probe_timestep: int = 500
 
 
 @dataclass
@@ -103,10 +101,81 @@ class EncodeRequest(Request):
 
 
 @dataclass
+class EmbedRequest(Request):
+    """Encode prompts into embeddings for later use with sample."""
+    kind: str = MessageKind.EMBED.value
+
+    model_id: str = "stabilityai/stable-diffusion-2-1"
+    prompt: str = ""
+    negative_prompt: str = ""
+    return_prompt_embeds: bool = True
+    return_negative_prompt_embeds: bool = True
+
+
+@dataclass
+class DecodeRequest(Request):
+    kind: str = MessageKind.DECODE.value
+    model_id: str = "runwayml/stable-diffusion-v1-5"
+    latents: Optional[Dict[str, Any]] = None   # packed array
+
+
+@dataclass
 class IntrospectRequest(Request):
     """Ask the server to dump model architecture / config info."""
     kind: str = MessageKind.INTROSPECT.value
     model_id: str = ""
+
+
+@dataclass
+class CleanupRequest(Request):
+    """Trigger VRAM and memory cleanup on the server."""
+    kind: str = MessageKind.CLEANUP.value
+    clear_model: bool = False  # if True, delete the loaded model from memory too
+
+
+@dataclass
+class TrainRequest(Request):
+    """Run training on the server on collected teacher samples."""
+    kind: str = MessageKind.TRAIN.value
+    
+    model_id: str = "runwayml/stable-diffusion-v1-5"
+    manifest_path: str = ""  # path to manifest.jsonl on server
+    output_dir: str = ""    # where to save checkpoints
+    
+    batch_size: int = 2
+    epochs: int = 1
+    learning_rate: float = 5e-5
+    lora_rank: int = 16
+    save_every: int = 50
+
+
+@dataclass
+class ListJobsRequest(Request):
+    kind: str = MessageKind.JOB_LIST.value
+    limit: int = 50
+
+
+@dataclass
+class AttachJobRequest(Request):
+    kind: str = MessageKind.JOB_ATTACH.value
+    target_job_id: str = ""
+    since_line: int = 0
+    max_lines: int = 200
+
+
+@dataclass
+class KillJobRequest(Request):
+    kind: str = MessageKind.JOB_KILL.value
+    target_job_id: str = ""
+    signal: str = "term"  # "term" | "kill"
+
+
+@dataclass
+class DatasetStatsRequest(Request):
+    kind: str = MessageKind.DATASET_STATS.value
+    manifest_path: str = ""  # path on server
+    max_records: int = 100000
+    sample_images: int = 16  # open first N images to get dimensions
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +232,18 @@ class ServerInfo(Response):
     torch_version: str = ""
     loaded_models: List[str] = field(default_factory=list)
     capabilities: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ProgressResponse(Response):
+    """Training progress update from server to client."""
+    kind: str = MessageKind.PROGRESS.value
+
+    step: int = 0
+    epoch: int = 0
+    loss: float = 0.0
+    message: str = ""
+    checkpoint_path: str = ""  # if a checkpoint was just saved
 
 
 @dataclass
