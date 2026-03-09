@@ -303,7 +303,7 @@ class SlopClient:
     def sample_from_embeds(
         self,
         prompt_embeds: np.ndarray,
-        negative_prompt_embeds: np.ndarray,
+        negative_prompt_embeds: Optional[np.ndarray] = None,
         initial_latents: Optional[np.ndarray] = None,
         # backward-compatible alias (some notebooks call `initial_latent`)
         initial_latent: Optional[np.ndarray] = None,
@@ -341,8 +341,9 @@ class SlopClient:
             capture_prompt_embeds=True,
             decode_latents=False,
             prompt_embeds_override=_packed(prompt_embeds, half=False),
-            negative_prompt_embeds_override=_packed(negative_prompt_embeds, half=False),
         )
+        if negative_prompt_embeds is not None:
+            req.negative_prompt_embeds_override = _packed(negative_prompt_embeds, half=False)
         # Accept either `initial_latents` (plural) or the historical alias
         # `initial_latent` (singular). Prefer the explicit plural if both are set.
         init = initial_latents if initial_latents is not None else initial_latent
@@ -354,7 +355,7 @@ class SlopClient:
         self,
         target_embeds: np.ndarray,
         base_embeds: np.ndarray,
-        negative_prompt_embeds: np.ndarray,
+        negative_prompt_embeds: Optional[np.ndarray] = None,
         num_steps: int = 50,
         seed: int = -1,
         batch_size: int = 1,
@@ -382,15 +383,16 @@ class SlopClient:
             delta_sample=True,
             prompt_embeds_override=_packed(target_embeds, half=False),
             base_prompt_embeds_override=_packed(base_embeds, half=False),
-            negative_prompt_embeds_override=_packed(negative_prompt_embeds, half=False),
         )
+        if negative_prompt_embeds is not None:
+            req.negative_prompt_embeds_override = _packed(negative_prompt_embeds, half=False)
         return Result.from_job(self._job(req))
 
     def probe_at(
         self,
         points: np.ndarray,
         prompt_embeds: np.ndarray,
-        negative_prompt_embeds: np.ndarray,
+        negative_prompt_embeds: Optional[np.ndarray] = None,
         timestep: int = 500,
         guidance_scale: float = 7.5,
         model_id: str = "runwayml/stable-diffusion-v1-5",
@@ -409,6 +411,36 @@ class SlopClient:
             negative_prompt_embeds=negative_prompt_embeds,
         ))
         return unpack_array(job.arrays["noise_preds"])
+
+    def probe_delta_at(
+        self,
+        points: np.ndarray,
+        *,
+        target_embeds: np.ndarray,
+        base_embeds: np.ndarray,
+        negative_prompt_embeds: Optional[np.ndarray] = None,
+        timestep: int = 500,
+        guidance_scale: float = 7.5,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+    ) -> np.ndarray:
+        """Return one batched delta probe from two embedding tensors.
+
+        This is a single server request (still does two score evaluations
+        server-side) and is preferred over two separate probe_at() calls.
+        """
+        job = self._job(
+            _probe_request(
+                model_id=model_id,
+                points=points,
+                timestep=timestep,
+                guidance_scale=guidance_scale,
+                prompt_embeds=target_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                base_prompt_embeds=base_embeds,
+                delta_probe=True,
+            )
+        )
+        return unpack_array(job.arrays["delta_noise_preds"])
 
     def render(self, latents: np.ndarray, model_id: str = "runwayml/stable-diffusion-v1-5") -> list[Image.Image]:
         """Decode a batch of latents into images."""

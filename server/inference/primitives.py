@@ -1,7 +1,7 @@
 import base64
 import io
 import math
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -42,8 +42,17 @@ def empty_prompt(pipe: Any, device: torch.device, dtype: torch.dtype) -> torch.T
     return encode_text(pipe, "", device, dtype)
 
 
-def prepare_conditioning(pipe: Any, req: Any, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor, bool]:
-    """Return positive and negative conditioning tensors."""
+def prepare_conditioning(
+    pipe: Any,
+    req: Any,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, Optional[torch.Tensor], bool]:
+    """Return positive conditioning and optional negative conditioning.
+
+    If negative conditioning is absent, downstream code should disable
+    classifier-free guidance (CFG) and run the UNet only once.
+    """
     use_override = req.prompt_embeds_override is not None
 
     if use_override:
@@ -56,12 +65,15 @@ def prepare_conditioning(pipe: Any, req: Any, device: torch.device, dtype: torch
                 unpack_array(req.negative_prompt_embeds_override).astype(np.float32)
             ).to(device=device, dtype=dtype)
         else:
-            negative_prompt_embeds = empty_prompt(pipe, device, dtype)
+            negative_prompt_embeds = None
 
         return prompt_embeds, negative_prompt_embeds, True
 
     prompt_embeds = encode_text(pipe, req.prompt, device, dtype)
-    negative_prompt_embeds = encode_text(pipe, req.negative_prompt or "", device, dtype)
+    if req.negative_prompt:
+        negative_prompt_embeds = encode_text(pipe, req.negative_prompt, device, dtype)
+    else:
+        negative_prompt_embeds = None
     return prompt_embeds, negative_prompt_embeds, False
 
 
@@ -79,24 +91,27 @@ def score(
     latent: torch.Tensor,
     timestep: torch.Tensor | int,
     prompt_embeds: torch.Tensor,
-    negative_prompt_embeds: torch.Tensor,
+    negative_prompt_embeds: Optional[torch.Tensor],
     guidance_scale: float,
 ) -> torch.Tensor:
     """Run one conditioned score evaluation."""
     batch_size = latent.shape[0]
     conditioned = repeat(prompt_embeds, batch_size)
-    negative = repeat(negative_prompt_embeds, batch_size)
-    do_cfg = guidance_scale > 1.0
+    do_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
+    negative = repeat(negative_prompt_embeds, batch_size) if negative_prompt_embeds is not None else None
 
     if do_cfg:
         latent_input = torch.cat([latent, latent], dim=0)
+        if negative is None:
+            raise RuntimeError("CFG requested but negative_prompt_embeds is None")
         embeds = torch.cat([negative, conditioned], dim=0)
     else:
         latent_input = latent
         embeds = conditioned
 
     latent_input = pipe.scheduler.scale_model_input(latent_input, timestep)
-    model_out = pipe.unet(latent_input, timestep, encoder_hidden_states=embeds).sample
+    with torch.inference_mode():
+        model_out = pipe.unet(latent_input, timestep, encoder_hidden_states=embeds).sample
 
     if not do_cfg:
         return model_out

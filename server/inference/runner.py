@@ -89,7 +89,7 @@ class InferenceRunner:
             return FluxTrajectoryHook(self.pipe)
         return SDTrajectoryHook(self.pipe)
 
-    def _conditioning(self, req: InferenceRequest, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    def _conditioning(self, req: InferenceRequest, device: torch.device, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return the conditioning tensors used by probe code paths."""
         prompt_embeds, negative_prompt_embeds, _ = prepare_conditioning(self.pipe, req, device, dtype)
         return prompt_embeds, negative_prompt_embeds
@@ -302,13 +302,22 @@ class InferenceRunner:
             "generator": generator,
         }
 
+        # If no negative conditioning is provided, disable CFG by forcing
+        # guidance_scale <= 1. This ensures the UNet runs only once.
+        if req.guidance_scale > 1.0:
+            if use_override and negative_prompt_embeds is None:
+                kwargs["guidance_scale"] = 1.0
+            if not use_override and not req.negative_prompt:
+                kwargs["guidance_scale"] = 1.0
+
         if req.latent_override is not None:
             kwargs["latents"] = torch.from_numpy(latent_batch(req.latent_override)).to(device=device, dtype=dtype)
 
         if use_override:
             kwargs["prompt_embeds"] = prompt_embeds
-            kwargs["negative_prompt_embeds"] = negative_prompt_embeds
-        elif "flux" not in req.model_id.lower() and req.negative_prompt:
+            if negative_prompt_embeds is not None and kwargs["guidance_scale"] > 1.0:
+                kwargs["negative_prompt_embeds"] = negative_prompt_embeds
+        elif "flux" not in req.model_id.lower() and req.negative_prompt and kwargs["guidance_scale"] > 1.0:
             kwargs["negative_prompt"] = req.negative_prompt
 
         images, records = hook.generate_with_tracking(
