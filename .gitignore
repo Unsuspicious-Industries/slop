@@ -1,4 +1,9 @@
 .mypy
+# nix
+.direnv/
+result
+result-*
+# venv (server deployment only — see containers/ and DEPLOYMENT.md)
 .venv
 .venv/
 .pytest*
