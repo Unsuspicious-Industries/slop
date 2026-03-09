@@ -22,3 +22,4 @@ data/generated/
 .hf_token*
 .hf/
 .huggingface/
+.env
